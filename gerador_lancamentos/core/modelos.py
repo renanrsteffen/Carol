@@ -99,3 +99,6 @@ class Lancamento:
     status: str = "pendente"   # ok | revisar | pendente | ja_lancado | ignorar
     observacao: str = ""
     parte: str = ""
+    motivo: str = ""           # resumo curto do que pede atenção (ex.: "Parcela de nota")
+    alternativas: list = field(default_factory=list)   # [{conta, nfs, texto}] outras possibilidades
+    principal: bool = True     # False = linha complementar (juros, retenção, desconto) do mesmo movimento

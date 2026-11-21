@@ -24,7 +24,14 @@ from .busca import Candidato, buscar, melhor_entre_contas
 from .modelos import Conta, ItemFinanceiro, Lancamento, Movimento, MovRazao, Titulo
 from .perfil import MODELOS_PADRAO, RUIDO_BANCARIO, Perfil, Regra, chave_memoria
 from .razao import Razao
+from .util import fmt_valor as br
 from .util import extrair_nfs, nf_chave, normalizar, tokens
+
+MOTIVO_BUSCA = {
+    "nf": "Valor ≠ nota citada", "exato": "Confirme a nota", "soma": "Confirme as notas",
+    "retencao": "Nota com impostos retidos", "parcela": "Parcela de nota", "juros": "Pago com juros/multa",
+    "desconto": "Pago com desconto", "parcial": "Pagamento parcial", "peps": "Notas mais antigas",
+}
 
 ROTULO_BUSCA = {
     "nf": "NF citada", "exato": "valor da nota", "soma": "soma de notas", "retencao": "nota com retenção",
@@ -46,6 +53,8 @@ class Contexto:
     razao: Razao | None = None
     titulos: list[Titulo] = field(default_factory=list)
     financeiro: list[ItemFinanceiro] = field(default_factory=list)
+    # decisões do operador por movimento: {conta, nfs, historico, aceito, ignorar}
+    forcados: dict = field(default_factory=dict)
 
 
 class Classificador:
@@ -172,8 +181,44 @@ class Classificador:
         saida: list[Lancamento] = []
         usados_razao: set[int] = set()
         for mov in sorted(movimentos, key=lambda m: (m.data, m.valor)):
-            saida.extend(self._classificar_um(mov, usados_razao))
+            f = self.ctx.forcados.get(mov.id)
+            ls = self._forcado(mov, f) if f and (f.get("conta") or f.get("ignorar")) else self._classificar_um(mov, usados_razao)
+            if f:
+                if f.get("historico") and ls:
+                    ls[0].historico = f["historico"].upper()
+                if f.get("nf_texto") is not None and ls:
+                    ls[0].nf = f["nf_texto"]
+                if f.get("aceito") and not f.get("ignorar"):
+                    for l in ls:
+                        if l.conta_contra and l.status in ("revisar", "pendente"):
+                            l.status = "ok"
+                    if ls:
+                        ls[0].motivo = ""
+            for i, l in enumerate(ls):
+                l.principal = i == 0
+            saida.extend(ls)
         return saida
+
+    def _forcado(self, mov: Movimento, f: dict) -> list[Lancamento]:
+        """Aplica a decisão do operador (conta escolhida, notas escolhidas ou ignorar)."""
+        if f.get("ignorar"):
+            return [self._base(mov, conta_contra=f.get("conta", ""), historico=self._generico(mov), status="ignorar",
+                               origem="Ignorado pelo operador", confianca=100)]
+        conta = self.contas.get(f["conta"])
+        if conta and conta.tipo in ("cliente", "fornecedor"):
+            r = self._lancar_parte(mov, conta, 100, "Escolha do operador", nfs=f.get("nfs") or None)
+            if r:
+                r[0].status = "ok"
+                r[0].alternativas = []
+                return r
+        hist = f.get("historico") or self._hist_regra_para_conta(mov, f["conta"]) or self._generico(mov, self.nome_conta(f["conta"]))
+        return [self._base(mov, conta_contra=f["conta"], historico=hist, status="ok", origem="Escolha do operador", confianca=100)]
+
+    def _hist_regra_para_conta(self, mov: Movimento, conta: str) -> str:
+        for r in self.regras:
+            if self.contas_regra.get(r.nome, ("", 0))[0] == conta and r.historico:
+                return formatar(r.historico, parte=nome_limpo(mov.descricao), descricao=descricao_curta(mov.descricao), nf="", mes=_mes(mov))
+        return ""
 
     def _base(self, mov: Movimento, **kw) -> Lancamento:
         l = Lancamento(
@@ -195,7 +240,7 @@ class Classificador:
             if abs((m.data - mov.data).days) <= 1:
                 usados_razao.add(id(m))
                 self._aprender_de_razao(mov, m)
-                return [self._base(mov, conta_contra=m.contrapartida, historico=m.historico, status="ja_lancado",
+                return [self._base(mov, conta_contra=m.contrapartida, historico=m.historico, status="ja_lancado", motivo="Já consta no razão",
                                    origem="Já consta no razão", confianca=100,
                                    observacao=f"Lote {m.lote} lanç. {m.lancamento}".strip())]
 
@@ -226,13 +271,20 @@ class Classificador:
         if parte and (score >= 88 or not regra):
             r = self._lancar_parte(mov, parte, score, "Cliente/fornecedor identificado")
             if r:
+                if score < 85:
+                    r[0].motivo = r[0].motivo or "Confirme o cliente/fornecedor"
+                if regra and regra[1][0]:
+                    r[0].alternativas.append({"conta": regra[1][0], "nfs": [], "texto": f"Regra '{regra[0].nome}'"})
                 return r
 
         # 5) regras de categoria
         if regra:
             r, (conta, conf) = regra
             hist = formatar(r.historico, parte=nome_limpo(mov.descricao) or kw_desc, descricao=kw_desc, nf="", mes=_mes(mov)) or self._generico(mov)
+            alts = [{"conta": parte.codigo, "nfs": [], "texto": f"{parte.nome} (nome parecido no extrato)"}] if parte else []
             return [self._base(mov, conta_contra=conta, historico=hist, status="ok" if conta and conf >= 80 else ("revisar" if conta else "pendente"),
+                               motivo="" if conta and conf >= 80 else ("Regra pouco usada no razão" if conta else "Regra sem conta definida"),
+                               alternativas=alts,
                                origem=f"Regra: {r.nome}", confianca=conf if conta else 40,
                                observacao="" if conta else f"Informe a conta da regra '{r.nome}' em Configurações")]
 
@@ -247,6 +299,7 @@ class Classificador:
                     return r
             return [self._base(mov, conta_contra=conta, historico=self._generico(mov, self.nome_conta(conta)),
                                status="revisar" if conf < 85 else "ok", origem="Semelhança com o razão",
+                               motivo="Semelhança com o razão" if conf < 85 else "",
                                confianca=conf, observacao=f"Parecido com: {hist_razao[:60]}")]
 
         # 7) procura o valor em todos os clientes/fornecedores (nome não identificado)
@@ -256,6 +309,8 @@ class Classificador:
             r = self._lancar_parte(mov, c, 75, "Busca nas notas em aberto", candidato=cand)
             if r:
                 r[0].status = "revisar"
+                r[0].motivo = "Nome fora do extrato"
+                r[0].alternativas = [{"conta": o.conta, "nfs": o.nfs, "texto": f"{self.nome_conta(o.conta)} — {o.explicacao}"} for o in outros]
                 r[0].observacao = ("Nome não aparece no extrato. " + r[0].observacao
                                    + (" | Também possível: " + "; ".join(f"{self.nome_conta(o.conta)}: {o.explicacao}" for o in outros) if outros else ""))
                 return r
@@ -265,7 +320,11 @@ class Classificador:
             r = self._lancar_parte(mov, parte, score, "Cliente/fornecedor identificado")
             if r:
                 return r
+        alts = [{"conta": o.conta, "nfs": o.nfs, "texto": f"{self.nome_conta(o.conta)} — {o.explicacao}"} for o in outros]
+        if parte:
+            alts.insert(0, {"conta": parte.codigo, "nfs": [], "texto": f"{parte.nome} (nome parecido)"})
         return [self._base(mov, historico=self._generico(mov), status="pendente", origem="Não identificado", confianca=0,
+                           motivo="Conta não identificada", alternativas=alts,
                            observacao=dica or "Escolha a conta de contrapartida")]
 
     # ------------------------------------------------------------------ partes / NF
@@ -290,9 +349,10 @@ class Classificador:
             abertos = self.titulos_abertos(conta.codigo)
             obs = ("Nenhuma nota em aberto no razão para " + parte if not abertos else
                    f"Nenhuma combinação das {len(abertos)} notas em aberto explica o valor: "
-                   + ", ".join(f"NF {t.nf or 's/n'} {t.saldo:.2f}" for t in abertos[:5]))
+                   + ", ".join(f"NF {t.nf or 's/n'} {br(t.saldo)}" for t in abertos[:5]))
             return [self._base(mov, conta_contra=conta.codigo, historico=hist, nf=nf_txt, parte=parte,
-                               status="revisar", origem=origem, confianca=min(score, 70), observacao=obs)]
+                               status="revisar", origem=origem, confianca=min(score, 70), observacao=obs,
+                               motivo="Nota não encontrada")]
 
         c = candidato
         nf_hist = c.nf_texto
@@ -317,13 +377,20 @@ class Classificador:
             principal = round(valor - c.juros, 2)
         out.append(self._base(mov, valor=principal, conta_contra=conta.codigo, historico=hist, nf=c.nf_texto,
                               parte=parte, status=status, origem=f"{origem} · {ROTULO_BUSCA.get(c.tipo, c.tipo)}",
-                              confianca=conf, observacao=obs))
+                              confianca=conf, observacao=obs,
+                              motivo="" if status == "ok" else MOTIVO_BUSCA.get(c.tipo, "Confirme a nota"),
+                              alternativas=[{"conta": a.conta, "nfs": a.nfs, "texto": a.explicacao} for a in alternativas]))
+        if mov.entrada and out[0].motivo:
+            out[0].motivo = out[0].motivo.replace("Pago com", "Recebido com").replace("Pagamento parcial", "Recebimento parcial")
+        if status == "ok" and c.tipo == "exato" and c.pontos < 90:
+            out[0].motivo = "Notas de mesmo valor"
+            out[0].status = "revisar"
         if c.juros > 0:
             if conta_juros:
                 out.append(self._base(mov, valor=c.juros, conta_contra=conta_juros,
                                       historico=self._modelo(chave_juros, nf=c.nf_texto, parte=parte), nf=c.nf_texto,
                                       parte=parte, status="revisar", origem=origem + " · juros", confianca=70,
-                                      observacao=f"{c.juros:.2f} acima do saldo da nota"))
+                                      observacao=f"{br(c.juros)} acima do saldo da nota"))
             else:
                 out[0].observacao += " | Configure a conta de juros para separar a diferença."
         # lançamentos sem banco: desconto e retenções
@@ -340,7 +407,7 @@ class Classificador:
             if conta_ret:
                 out.append(self._sem_banco(mov, conta.codigo, conta_ret, v, pagando, h, c, parte, "retenção"))
             else:
-                out[0].observacao += f" | {nome}: {v:.2f} (configure a conta de {nome.split()[0]} retido)"
+                out[0].observacao += f" | {nome}: {br(v)} (configure a conta de {nome.split()[0]} retido)"
         c.aplicar()
         return out
 
@@ -423,6 +490,7 @@ class Classificador:
                 chave = chave[:-3]
             out.append(self._base(sub, historico=self._modelo(chave, nf=it.nf, parte=nome), nf=it.nf, parte=nome,
                                   status="pendente", origem="Relatório financeiro", confianca=30, descricao_extrato=mov.descricao,
+                                  motivo="Sem conta no razão",
                                   observacao=f"'{it.nome}' não encontrado no razão; escolha a conta ({it.descricao})".strip()))
         return out
 

@@ -41,6 +41,8 @@ def init():
     SS.setdefault("totais", {})
     SS.setdefault("versao", 0)
     SS.setdefault("editados", set())
+    SS.setdefault("forcados", {})
+    SS.setdefault("sel_mov", None)
     SS.setdefault("salvo_em", None)
     if "backup_feito" not in SS:
         SS.backup_feito = True
@@ -60,7 +62,7 @@ def salvar_trabalho_atual():
     try:
         arm.salvar_trabalho(SS.perfil.nome, competencia(SS.lancs), empacotar(
             lancs=SS.lancs, movs=SS.movs, titulos_inicio=SS.titulos_inicio, titulos=SS.titulos, razao=SS.razao,
-            totais=SS.totais, financeiro=SS.get("financeiro_itens", []), editados=SS.editados))
+            totais=SS.totais, financeiro=SS.get("financeiro_itens", []), forcados=SS.forcados))
         SS.salvo_em = datetime.now()
     except OSError as e:
         st.error(f"Erro ao salvar o trabalho: {e}")
@@ -74,6 +76,11 @@ def abrir_trabalho(nome_cliente: str, comp: str):
     SS.update(desempacotar(d))
     SS.salvo_em = d.get("_salvo_em")
     SS.versao += 1
+
+
+def descricao_curta_ui(t: str, n: int = 48) -> str:
+    t = " ".join(str(t).split())
+    return t if len(t) <= n else t[: n - 1] + "…"
 
 
 def rotulo(cod: str) -> str:
@@ -115,6 +122,7 @@ with st.sidebar:
     elif SS.perfil is None or SS.perfil.nome != escolha:
         SS.perfil = Perfil.carregar(escolha)
         SS.lancs, SS.titulos, SS.titulos_inicio, SS.razao, SS.movs, SS.salvo_em = [], [], [], None, [], None
+        SS.forcados, SS.sel_mov = {}, None
         trabalhos = arm.listar_trabalhos(escolha)
         if trabalhos:  # reabre automaticamente o trabalho mais recente
             abrir_trabalho(escolha, trabalhos[0][0])
@@ -160,7 +168,24 @@ aba_arq, aba_lanc, aba_notas, aba_exp, aba_cfg, aba_bkp = st.tabs(
 
 
 # ------------------------------------------------------------------------------------ 1. arquivos
-def processar(razoes, plano, extratos_cfg, financeiros, manter_editados=False):
+def reclassificar():
+    """Refaz a classificação a partir das notas iniciais, aplicando as decisões do operador.
+    Assim, notas escolhidas num movimento não são usadas de novo em outro."""
+    if not SS.movs:
+        return
+    titulos = copy.deepcopy(SS.titulos_inicio)
+    itens = [copy.copy(i) for i in SS.get("financeiro_itens", [])]
+    for i in itens:
+        i.usado = False
+    clf = Classificador(Contexto(perfil=perfil, razao=SS.razao, titulos=titulos, financeiro=itens, forcados=SS.forcados))
+    novos = clf.classificar(SS.movs)
+    novos.sort(key=lambda l: (l.data, l.conta_banco, l.mov_id))
+    SS.update(lancs=novos, titulos=clf.titulos, contas_regra=clf.contas_regra)
+    SS.versao += 1
+    salvar_trabalho_atual()
+
+
+def processar(razoes, plano, extratos_cfg, financeiros):
     razao = Razao.carregar(razoes) if razoes else Razao()
     if plano:
         razao.aplicar_plano(ler_plano(plano))
@@ -168,7 +193,6 @@ def processar(razoes, plano, extratos_cfg, financeiros, manter_editados=False):
         if cod in razao.contas:
             razao.contas[cod].tipo = tipo
     titulos = apurar_titulos(razao, perfil.tipos_conta)
-    titulos_inicio = copy.deepcopy(titulos)
     itens = []
     for f in financeiros or []:
         itens.extend(ler_financeiro(f))
@@ -181,18 +205,10 @@ def processar(razoes, plano, extratos_cfg, financeiros, manter_editados=False):
         s = -sum(m.valor for m in movs_arq if m.valor < 0)
         te, ts = totais.get(conta, (0.0, 0.0))
         totais[conta] = (te + e, ts + s)
-    clf = Classificador(Contexto(perfil=perfil, razao=razao, titulos=titulos, financeiro=itens))
-    novos = clf.classificar(movs)
-    if manter_editados and SS.editados:
-        antigos = [l for l in SS.lancs if l.mov_id in SS.editados]
-        novos = [l for l in novos if l.mov_id not in SS.editados] + antigos
-    else:
-        SS.editados = set()
-    novos.sort(key=lambda l: (l.data, l.conta_banco, l.mov_id))
-    SS.update(lancs=novos, titulos=titulos, titulos_inicio=titulos_inicio, razao=razao, movs=movs, totais=totais,
-              contas_regra=clf.contas_regra, financeiro_itens=itens)
-    SS.versao += 1
-    salvar_trabalho_atual()
+    ids = {m.id for m in movs}
+    SS.forcados = {k: v for k, v in SS.forcados.items() if k in ids}  # decisões anteriores dos mesmos movimentos
+    SS.update(titulos_inicio=titulos, razao=razao, movs=movs, totais=totais, financeiro_itens=itens, sel_mov=None)
+    reclassificar()
 
 
 with aba_arq:
@@ -274,54 +290,141 @@ with aba_arq:
 
 
 # ----------------------------------------------------------------------------------- 2. lançamentos
-def lancs_para_df(lancs: list[Lancamento]) -> pd.DataFrame:
-    return pd.DataFrame([{
-        "Status": ROTULO_STATUS.get(l.status, l.status),
-        "Data": fmt_data(l.data),
-        "Banco": l.conta_banco,
-        "E/S": "Entrada" if l.natureza == "entrada" else "Saída",
-        "Valor": l.valor,
-        "Contrapartida": rotulo(l.conta_contra),
-        "Histórico": l.historico,
-        "NF": l.nf,
-        "Extrato": l.descricao_extrato,
-        "Como foi sugerido": l.origem,
-        "Confiança": l.confianca,
-        "Observação": l.observacao,
-        "Memorizar": False,
-    } for l in lancs])
+ORDEM = {"pendente": 0, "revisar": 1, "ok": 2, "ja_lancado": 3, "ignorar": 4}
+ICONE = {"pendente": "🔴", "revisar": "🟡", "ok": "🟢", "ja_lancado": "📗", "ignorar": "⚪"}
+TITULO_STATUS = {"pendente": "Precisa de decisão", "revisar": "Conferir", "ok": "Pronto",
+                 "ja_lancado": "Já está no razão", "ignorar": "Ignorado"}
 
 
-def aplicar_edicao(key: str, indices: list[int]):
-    estado = SS.get(key) or {}
-    mudou = False
-    for pos, alteracoes in estado.get("edited_rows", {}).items():
-        l: Lancamento = SS.lancs[indices[int(pos)]]
-        for campo, valor in alteracoes.items():
-            mudou = True
-            if campo == "Status":
-                l.status = STATUS_DE.get(valor, "revisar")
-            elif campo == "Contrapartida":
-                l.conta_contra = cod_de(valor)
-                if l.status in ("pendente", "revisar") and l.conta_contra:
-                    l.status = "ok"
-            elif campo == "Histórico":
-                l.historico = str(valor or "").upper()
-            elif campo == "NF":
-                l.nf = str(valor or "")
-            elif campo == "Valor":
-                l.valor = round(float(valor or 0), 2)
-            elif campo == "Observação":
-                l.observacao = str(valor or "")
-            elif campo == "Memorizar" and valor:
-                perfil.memorizar(l.descricao_extrato, l.conta_contra, l.historico,
-                                 cnpj=next((m.cnpj for m in SS.movs if m.id == l.mov_id), None), parte=l.parte)
-                st.toast(f"Memorizado: {l.descricao_extrato[:40]} → {rotulo(l.conta_contra)}")
-            SS.editados.add(l.mov_id)
-    if mudou:
-        perfil.salvar()
-        SS.versao += 1
-        salvar_trabalho_atual()
+def agrupar(lancs: list[Lancamento]) -> list[list[Lancamento]]:
+    """Um grupo por movimento do extrato (linha principal + juros/retenções/desconto)."""
+    grupos: dict[str, list[Lancamento]] = {}
+    for l in lancs:
+        grupos.setdefault(l.mov_id, []).append(l)
+    for g in grupos.values():
+        g.sort(key=lambda l: not l.principal)
+    return sorted(grupos.values(), key=lambda g: (g[0].data, g[0].conta_banco, g[0].mov_id))
+
+
+def status_grupo(g: list[Lancamento]) -> str:
+    return min((l.status for l in g), key=lambda s: ORDEM.get(s, 9))
+
+
+def nome_curto(cod: str, n: int = 34) -> str:
+    if not cod:
+        return "—"
+    nome = SS.razao.contas[cod].nome if SS.razao and cod in SS.razao.contas else cod
+    return nome if len(nome) <= n else nome[: n - 1] + "…"
+
+
+def valor_sinal(l: Lancamento) -> str:
+    return ("+ " if l.natureza == "entrada" else "− ") + fmt_valor(l.valor)
+
+
+def decidir(mov_id: str, decisao: dict | None, memorizar: bool = False):
+    if decisao is None:
+        SS.forcados.pop(mov_id, None)
+    else:
+        SS.forcados[mov_id] = decisao
+    reclassificar()
+    if memorizar:
+        g = [l for l in SS.lancs if l.mov_id == mov_id]
+        if g and g[0].conta_contra:
+            mov = next((m for m in SS.movs if m.id == mov_id), None)
+            perfil.memorizar(g[0].descricao_extrato, g[0].conta_contra, g[0].historico,
+                             cnpj=mov.cnpj if mov else None, parte=g[0].parte)
+            perfil.salvar()
+    SS.sel_mov = None   # a fila segue para o próximo
+
+
+def painel(g: list[Lancamento]):
+    p = g[0]
+    st_g = status_grupo(g)
+    mov_id = p.mov_id
+    forcado = SS.forcados.get(mov_id)
+    with st.container(border=True):
+        cor = "red" if p.natureza == "saida" else "green"
+        st.markdown(f"##### {ICONE[st_g]} :{cor}[{valor_sinal(p) if len(g) == 1 else ('+ ' if p.natureza == 'entrada' else '− ') + fmt_valor(sum(l.valor for l in g if l.conta_banco == p.conta_banco))}]"
+                    f" &nbsp;·&nbsp; {fmt_data(p.data)}")
+        st.caption(f"Extrato ({rotulo(p.conta_banco)}): **{p.descricao_extrato}**")
+
+        # por que precisa de atenção
+        expl = p.observacao.split(" | ")[0] if p.observacao else ""
+        detalhes = [d for d in (p.observacao.split(" | ")[1:] if p.observacao else []) if d]
+        if st_g == "pendente":
+            st.error(f"**{p.motivo or 'Precisa de decisão'}**" + (f"  \n{expl}" if expl and expl != p.motivo else ""))
+        elif st_g == "revisar":
+            st.warning(f"**{p.motivo or 'Conferir'}**" + (f"  \n{expl}" if expl and expl != p.motivo else ""))
+        elif st_g == "ja_lancado":
+            st.info(f"Já consta no razão ({expl}). Não será exportado.")
+        elif st_g == "ignorar":
+            st.info("Ignorado: não será exportado.")
+        else:
+            st.success("Pronto para exportar" + (" — decidido pelo operador" if forcado else ""))
+
+        if detalhes and st_g in ("pendente", "revisar"):
+            st.caption("  \n".join("• " + d for d in detalhes))
+
+        # lançamento sugerido
+        if st_g != "ignorar":
+            st.markdown("**Lançamento**")
+            for l in g:
+                dc_banco = "D" if l.natureza == "entrada" else "C"
+                if l.principal or l.conta_banco == p.conta_banco:
+                    linha = f"{dc_banco} {nome_curto(l.conta_banco, 26)} · {'C' if dc_banco == 'D' else 'D'} **{nome_curto(l.conta_contra, 40)}**"
+                else:
+                    linha = f"{'D' if l.natureza == 'entrada' else 'C'} {nome_curto(l.conta_banco, 26)} · {'C' if l.natureza == 'entrada' else 'D'} **{nome_curto(l.conta_contra, 40)}** _(sem banco)_"
+                st.markdown(f"{linha} &nbsp; `{fmt_valor(l.valor)}`  \n<span style='color:#6b7280;font-size:0.85em'>{l.historico or '—'}</span>",
+                            unsafe_allow_html=True)
+
+        if st_g == "ja_lancado":
+            if st.button("Não está no razão — lançar mesmo assim", key=f"nl_{mov_id}"):
+                decidir(mov_id, {"conta": p.conta_contra, "aceito": True})
+                st.rerun()
+            return
+
+        # decisão
+        st.markdown("**Decisão**")
+        alts = p.alternativas or []
+        opcoes = ["Manter a sugestão"] if p.conta_contra else []
+        opcoes += [f"{a['texto']}" for a in alts]
+        opcoes += ["Escolher outra conta"]
+        escolha = st.radio("Decisão", opcoes, key=f"dec_{mov_id}_{SS.versao}", label_visibility="collapsed")
+        conta_outra = ""
+        if escolha == "Escolher outra conta":
+            ops = opcoes_contas()
+            conta_outra = cod_de(st.selectbox("Conta de contrapartida", ops, index=None, placeholder="Digite para buscar a conta…",
+                                              key=f"ct_{mov_id}_{SS.versao}"))
+        with st.expander("Ajustar histórico ou nota"):
+            hist = st.text_input("Histórico", p.historico, key=f"h_{mov_id}_{SS.versao}")
+            nf = st.text_input("Nº da nota", p.nf, key=f"nf_{mov_id}_{SS.versao}")
+        memo = st.checkbox("Usar sempre para este texto do extrato", key=f"m_{mov_id}_{SS.versao}",
+                           help="Nos próximos extratos deste cliente, o mesmo texto vai direto para esta conta.")
+
+        b1, b2, b3 = st.columns([2, 1, 1])
+        if b1.button("✔ Confirmar", type="primary", key=f"ok_{mov_id}", width="stretch",
+                     disabled=escolha == "Escolher outra conta" and not conta_outra):
+            dec = dict(forcado or {})
+            dec["aceito"] = True
+            if escolha == "Escolher outra conta":
+                dec.update(conta=conta_outra, nfs=[])
+                dec.pop("historico", None)
+            elif escolha != "Manter a sugestão":
+                a = alts[opcoes.index(escolha) - (1 if p.conta_contra else 0)]
+                dec.update(conta=a["conta"], nfs=a.get("nfs") or [])
+                dec.pop("historico", None)
+            if hist.strip() and hist.strip().upper() != p.historico and escolha == "Manter a sugestão":
+                dec["historico"] = hist.strip().upper()
+            if nf != p.nf and escolha == "Manter a sugestão":
+                dec["nf_texto"] = nf.strip()
+            decidir(mov_id, dec, memo)
+            st.rerun()
+        if b2.button("Ignorar", key=f"ig_{mov_id}", width="stretch", help="Não exportar este movimento"):
+            decidir(mov_id, {"ignorar": True, "conta": p.conta_contra})
+            st.rerun()
+        if forcado and b3.button("↺ Desfazer", key=f"un_{mov_id}", width="stretch", help="Voltar à sugestão do programa"):
+            decidir(mov_id, None)
+            st.rerun()
 
 
 with aba_lanc:
@@ -329,63 +432,75 @@ with aba_lanc:
     if not lancs:
         st.info("Gere os lançamentos na aba **1 · Arquivos**.")
     else:
-        cont = {s: sum(1 for l in lancs if l.status == s) for s in ROTULO_STATUS}
-        m = st.columns(5)
-        m[0].metric("✅ OK", cont["ok"])
-        m[1].metric("🟡 Revisar", cont["revisar"])
-        m[2].metric("🔴 Pendente", cont["pendente"])
-        m[3].metric("📗 Já no razão", cont["ja_lancado"])
-        m[4].metric("Com NF vinculada", sum(1 for l in lancs if l.nf))
+        grupos = agrupar(lancs)
+        cont = {k: 0 for k in ORDEM}
+        for g in grupos:
+            cont[status_grupo(g)] += 1
+        atencao = cont["pendente"] + cont["revisar"]
 
-        f1, f2, f3 = st.columns([2, 2, 1])
-        filtro = f1.multiselect("Mostrar", STATUS_OPCOES, default=["OK", "Revisar", "Pendente"])
-        busca = f2.text_input("Buscar no extrato / histórico", "")
-        if f3.button("🔄 Reclassificar", help="Aplica o que foi memorizado às linhas não editadas"):
-            st.session_state["_reclass"] = True
-
-        indices = [i for i, l in enumerate(lancs)
-                   if ROTULO_STATUS.get(l.status) in filtro
-                   and (not busca or busca.upper() in (l.descricao_extrato + " " + l.historico).upper())]
-        df = lancs_para_df([lancs[i] for i in indices])
-        key = f"ed_{SS.versao}_{'-'.join(filtro)}_{busca}"
-        if df.empty:
-            st.info("Nenhuma linha com esse filtro.")
+        # resumo em uma linha
+        if atencao:
+            st.markdown(f"#### {atencao} movimento(s) pedem sua atenção")
         else:
-            st.data_editor(
-                df, key=key, on_change=aplicar_edicao, args=(key, indices), hide_index=True,
-                width="stretch", height=min(700, 40 + 35 * len(df)),
-                column_config={
-                    "Status": st.column_config.SelectboxColumn(options=STATUS_OPCOES, width="small", required=True),
-                    "Data": st.column_config.TextColumn(disabled=True, width="small"),
-                    "Banco": st.column_config.TextColumn(disabled=True, width="small"),
-                    "E/S": st.column_config.TextColumn(disabled=True, width="small"),
-                    "Valor": st.column_config.NumberColumn(format="%.2f", width="small"),
-                    "Contrapartida": st.column_config.SelectboxColumn(options=opcoes_contas(), width="large"),
-                    "Histórico": st.column_config.TextColumn(width="large"),
-                    "NF": st.column_config.TextColumn(width="small"),
-                    "Extrato": st.column_config.TextColumn(disabled=True, width="large"),
-                    "Como foi sugerido": st.column_config.TextColumn(disabled=True),
-                    "Confiança": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d%%", width="small"),
-                    "Observação": st.column_config.TextColumn(width="large"),
-                    "Memorizar": st.column_config.CheckboxColumn(help="Usar esta conta e histórico sempre que este texto aparecer no extrato"),
-                },
-            )
-        st.caption("Dica: ao trocar a contrapartida a linha vira OK. Marque **Memorizar** para o programa aprender "
-                   "(vale para os próximos meses deste cliente). Lançamentos de juros/desconto aparecem como linhas extras do mesmo movimento.")
+            st.markdown("#### ✅ Tudo conferido — pronto para exportar")
+        st.caption(f"🔴 {cont['pendente']} precisam de decisão · 🟡 {cont['revisar']} para conferir · "
+                   f"🟢 {cont['ok']} prontos · 📗 {cont['ja_lancado']} já no razão · ⚪ {cont['ignorar']} ignorados")
+        total_dec = len(grupos) - cont["ja_lancado"]
+        st.progress((total_dec - atencao) / total_dec if total_dec else 1.0)
 
-        if SS.pop("_reclass", False):
-            clf = Classificador(Contexto(perfil=perfil, razao=SS.razao, titulos=copy.deepcopy(SS.titulos_inicio),
-                                         financeiro=[copy.copy(i) for i in SS.get("financeiro_itens", [])]))
-            for i in clf.financeiro:
-                i.usado = False
-            novos = clf.classificar(SS.movs)
-            antigos = [l for l in SS.lancs if l.mov_id in SS.editados]
-            novos = [l for l in novos if l.mov_id not in SS.editados] + antigos
-            novos.sort(key=lambda l: (l.data, l.conta_banco, l.mov_id))
-            SS.lancs, SS.titulos = novos, clf.titulos
-            SS.versao += 1
-            salvar_trabalho_atual()
-            st.rerun()
+        f1, f2 = st.columns([3, 2])
+        filtros = {f"⚠️ Atenção ({atencao})": ("pendente", "revisar"), f"🟢 Prontos ({cont['ok']})": ("ok",),
+                   f"📗 No razão ({cont['ja_lancado']})": ("ja_lancado",), f"⚪ Ignorados ({cont['ignorar']})": ("ignorar",),
+                   f"Todos ({len(grupos)})": tuple(ORDEM)}
+        chaves = list(filtros)
+        padrao = chaves[0] if atencao else chaves[-1]
+        filtro = f1.segmented_control("Mostrar", chaves, default=padrao, key=f"filtro_{atencao == 0}",
+                                      label_visibility="collapsed") or padrao
+        busca = f2.text_input("Buscar", placeholder="🔎 Buscar por texto, conta ou valor", label_visibility="collapsed")
+
+        vis = [g for g in grupos if status_grupo(g) in filtros[filtro]]
+        if busca:
+            b = busca.upper()
+            vis = [g for g in vis if b in (g[0].descricao_extrato + " " + g[0].historico + " " + nome_curto(g[0].conta_contra, 99)).upper()
+                   or b.replace(".", "").replace(",", ".") in f"{g[0].valor:.2f}"]
+        if filtros[filtro] == ("pendente", "revisar"):
+            vis.sort(key=lambda g: (ORDEM[status_grupo(g)], g[0].data))
+
+        if not vis:
+            st.success("Nada aqui. 🎉" if filtro == chaves[0] else "Nenhum movimento neste filtro.")
+        else:
+            col_t, col_p = st.columns([11, 8], gap="medium")
+            with col_t:
+                df = pd.DataFrame([{
+                    " ": ICONE[status_grupo(g)],
+                    "Data": g[0].data.strftime("%d/%m"),
+                    "Valor": valor_sinal(g[0]) if len(g) == 1 else ("+ " if g[0].natureza == "entrada" else "− ")
+                    + fmt_valor(sum(l.valor for l in g if l.conta_banco == g[0].conta_banco)),
+                    "Atenção": g[0].motivo if status_grupo(g) in ("pendente", "revisar") else "",
+                    "Extrato": descricao_curta_ui(g[0].descricao_extrato, 22),
+                    "Lançar em": nome_curto(g[0].conta_contra, 17) + (f"  +{len(g) - 1}" if len(g) > 1 else ""),
+                } for g in vis])
+                if not any(df["Atenção"]):
+                    df = df.drop(columns=["Atenção"])
+                estilo = df.style.map(lambda v: "color:#b42318" if str(v).startswith("−") else "color:#067647", subset=["Valor"])
+                if "Atenção" in df:
+                    estilo = estilo.map(lambda v: "color:#b54708;font-weight:600" if v else "", subset=["Atenção"])
+                ev = st.dataframe(estilo, hide_index=True, width="stretch", height=min(640, 38 + 35 * len(df)),
+                                  on_select="rerun", selection_mode="single-row",
+                                  key=f"tab_{SS.versao}_{filtro}_{busca}",
+                                  column_config={" ": st.column_config.TextColumn(width=28),
+                                                 "Data": st.column_config.TextColumn(width=52),
+                                                 "Valor": st.column_config.TextColumn(width=88),
+                                                 "Atenção": st.column_config.TextColumn(width=150),
+                                                 "Extrato": st.column_config.TextColumn(width=125),
+                                                 "Lançar em": st.column_config.TextColumn(width=115)})
+                linhas_sel = ev.selection.rows if ev and ev.selection else []
+                if linhas_sel:
+                    SS.sel_mov = vis[linhas_sel[0]][0].mov_id
+                st.caption("Clique numa linha para ver os detalhes e decidir.")
+            with col_p:
+                atual = next((g for g in vis if g[0].mov_id == SS.get("sel_mov")), vis[0])
+                painel(atual)
 
 
 # ---------------------------------------------------------------------------------- 3. notas em aberto

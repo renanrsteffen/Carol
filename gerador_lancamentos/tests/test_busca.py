@@ -122,3 +122,36 @@ def test_saldo_anterior_vira_titulo(tmp_path):
     abertos = {(t.nf, t.saldo) for t in tits if t.aberto}
     # pagamento sem NF abate o mais antigo (saldo anterior) por PEPS
     assert abertos == {("", 2000.0), ("900", 1000.0)}
+
+
+def _clf_simples(forcados=None):
+    r = Razao()
+    r.contas = {"5": Conta("5", "BANCO X", tipo="banco"),
+                "101": Conta("101", "ALFA LTDA", tipo="cliente"), "102": Conta("102", "BETA LTDA", tipo="cliente"),
+                "700": Conta("700", "OUTRAS RECEITAS")}
+    tit = [Titulo("101", "ALFA LTDA", "cliente", "1", date(2026, 10, 1), 500, 500),
+           Titulo("102", "BETA LTDA", "cliente", "2", date(2026, 10, 1), 500, 500)]
+    return Classificador(Contexto(perfil=Perfil(nome="t"), razao=r, titulos=tit, forcados=forcados or {})), tit
+
+
+def test_ambiguo_vira_pendente_com_alternativas():
+    clf, _ = _clf_simples()
+    l = clf.classificar([Movimento("m", D, "DEPOSITO", 500.0, conta_banco="5")])[0]
+    assert l.status == "pendente" and l.motivo
+    assert {a["conta"] for a in l.alternativas} == {"101", "102"}
+
+
+def test_decisao_do_operador_escolhe_alternativa_e_baixa_nota():
+    clf, tit = _clf_simples({"m": {"conta": "102", "nfs": ["2"], "aceito": True}})
+    l = clf.classificar([Movimento("m", D, "DEPOSITO", 500.0, conta_banco="5")])[0]
+    assert (l.conta_contra, l.nf, l.status) == ("102", "2", "ok") and tit[1].saldo == 0 and tit[0].saldo == 500
+
+
+def test_decisao_conta_comum_e_ignorar():
+    clf, _ = _clf_simples({"a": {"conta": "700", "aceito": True, "historico": "Vlr. ref. outras receitas"},
+                           "b": {"ignorar": True}})
+    ls = clf.classificar([Movimento("a", D, "DEPOSITO", 10.0, conta_banco="5"),
+                          Movimento("b", D, "DEPOSITO", 20.0, conta_banco="5")])
+    a = next(l for l in ls if l.mov_id == "a"); b = next(l for l in ls if l.mov_id == "b")
+    assert a.conta_contra == "700" and a.status == "ok" and a.historico == "VLR. REF. OUTRAS RECEITAS"
+    assert b.status == "ignorar"

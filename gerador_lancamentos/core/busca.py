@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import date
 
 from .modelos import Titulo
+from .util import fmt_valor as br
 
 TOL = 0.011  # um centavo de arredondamento
 
@@ -122,11 +123,11 @@ def buscar(abertos: list[Titulo], valor: float, data: date | None = None, nfs: l
                 if c:
                     cands.append(c)
             elif valor - soma <= max(1.0, soma * tol):
-                add("juros", [Baixa(t, t.saldo) for t in citadas], 92, f"NF citada; {valor - soma:.2f} de juros/multa",
+                add("juros", [Baixa(t, t.saldo) for t in citadas], 92, f"NF citada; {br(valor - soma)} de juros/multa",
                     juros=round(valor - soma, 2))
             else:
                 add("nf", [Baixa(t, t.saldo) for t in citadas], 70,
-                    f"NF citada, mas o valor ({valor:.2f}) é maior que o saldo ({soma:.2f})", juros=round(valor - soma, 2))
+                    f"NF citada, mas o valor ({br(valor)}) é maior que o saldo ({br(soma)})", juros=round(valor - soma, 2))
 
     # 2) uma nota com o mesmo saldo
     iguais = [t for t in abertos if abs(t.saldo - valor) < TOL]
@@ -178,7 +179,7 @@ def buscar(abertos: list[Titulo], valor: float, data: date | None = None, nfs: l
         dif = round(valor - t.saldo, 2)
         if 0 < dif <= max(1.0, t.saldo * tol):
             pontos = 80 - int(10 * dif / max(t.saldo, 1))
-            add("juros", [Baixa(t, t.saldo)], pontos, f"NF {t.nf or 's/n'} + {dif:.2f} de juros/multa", juros=dif)
+            add("juros", [Baixa(t, t.saldo)], pontos, f"NF {t.nf or 's/n'} + {br(dif)} de juros/multa", juros=dif)
     # juros sobre soma de notas consecutivas (as mais antigas)
     acum = 0.0
     for i, t in enumerate(abertos[:10]):
@@ -186,20 +187,20 @@ def buscar(abertos: list[Titulo], valor: float, data: date | None = None, nfs: l
         dif = round(valor - acum, 2)
         if i and 0 < dif <= max(1.0, acum * tol / 2):
             add("juros", [Baixa(x, x.saldo) for x in abertos[: i + 1]], 72,
-                f"Notas mais antigas ({i + 1}) + {dif:.2f} de juros", juros=dif)
+                f"Notas mais antigas ({i + 1}) + {br(dif)} de juros", juros=dif)
 
     # 7) desconto pequeno (valor um pouco abaixo da nota)
     for t in abertos:
         dif = round(t.saldo - valor, 2)
         if 0 < dif <= max(0.5, t.saldo * min(tol, 0.05)):
             add("desconto", [Baixa(t, t.saldo)], 70 - int(10 * dif / max(t.saldo, 1)),
-                f"NF {t.nf or 's/n'} com {dif:.2f} a menos (desconto/abatimento?)", desconto=dif)
+                f"NF {t.nf or 's/n'} com {br(dif)} a menos (desconto/abatimento?)", desconto=dif)
 
     # 8) pagamento parcial / PEPS
     primeiro = abertos[0]
     if valor < primeiro.saldo - TOL:
         add("parcial", [Baixa(primeiro, valor)], 55,
-            f"Pagamento parcial da NF {primeiro.nf or 's/n'} (mais antiga); fica {primeiro.saldo - valor:.2f} em aberto")
+            f"Pagamento parcial da NF {primeiro.nf or 's/n'} (mais antiga); fica {br(primeiro.saldo - valor)} em aberto")
     else:
         restante, baixas = valor, []
         for t in abertos:
@@ -246,11 +247,11 @@ def _parcela_ou_parcial(titulos: list[Titulo], valor: float, pontos: int, origem
             if abs((t.valor - t.saldo) - pagas * parc) > 0.05 * n:
                 continue
             return Candidato(t.conta, "parcela", [Baixa(t, valor)], pontos,
-                             f"Parcela {k}/{n} da NF {t.nf or 's/n'} ({t.valor:.2f} ÷ {n})", parcela=f"{k}/{n}")
+                             f"Parcela {k}/{n} da NF {t.nf or 's/n'} ({br(t.valor)} ÷ {n})", parcela=f"{k}/{n}")
     if so_parcela:
         return None
     return Candidato(t.conta, "parcial", [Baixa(t, valor)], pontos - 15,
-                     f"Pagamento parcial da NF {t.nf or 's/n'} ({origem}); fica {t.saldo - valor:.2f} em aberto")
+                     f"Pagamento parcial da NF {t.nf or 's/n'} ({origem}); fica {br(t.saldo - valor)} em aberto")
 
 
 def melhor_entre_contas(por_conta: dict[str, list[Titulo]], valor: float, data: date | None, nfs: list[str] | None,

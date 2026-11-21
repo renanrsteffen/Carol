@@ -106,14 +106,19 @@ def gerar_conferencia(lancs: list[Lancamento], titulos: list[Titulo], nomes: dic
     _larguras(ws, [40, 16, 16, 18, 16, 14, 14])
 
     ws2 = wb.create_sheet("Lançamentos")
-    _cabecalho(ws2, ["Status", "Data", "Banco", "Natureza", "Valor", "Contrapartida", "Nome contrapartida",
+    _cabecalho(ws2, ["Status", "Atenção", "Data", "Banco", "Natureza", "Valor", "Contrapartida", "Nome contrapartida",
                      "Histórico", "NF", "Descrição no extrato", "Origem", "Confiança", "Observação"])
+    cores = {"pendente": "FDE2E1", "revisar": "FEF3C7", "ja_lancado": "E0F2FE", "ignorar": "F3F4F6"}
     for l in sorted(lancs, key=lambda x: (x.data, x.conta_banco)):
-        ws2.append([ROTULO_STATUS.get(l.status, l.status), fmt_data(l.data), l.conta_banco, l.natureza, l.valor,
+        ws2.append([ROTULO_STATUS.get(l.status, l.status), l.motivo if l.status in ("pendente", "revisar") else "",
+                    fmt_data(l.data), l.conta_banco, l.natureza, l.valor,
                     l.conta_contra, nomes.get(str(l.conta_contra), ""), l.historico, l.nf, l.descricao_extrato,
                     l.origem, l.confianca, l.observacao])
-        ws2.cell(ws2.max_row, 5).number_format = "#,##0.00"
-    _larguras(ws2, [12, 11, 10, 9, 13, 12, 32, 50, 12, 50, 28, 10, 50])
+        ws2.cell(ws2.max_row, 6).number_format = "#,##0.00"
+        if l.status in cores:
+            for c in ws2[ws2.max_row]:
+                c.fill = PatternFill("solid", fgColor=cores[l.status])
+    _larguras(ws2, [12, 26, 11, 10, 9, 13, 12, 32, 50, 12, 50, 28, 10, 50])
     ws2.auto_filter.ref = ws2.dimensions
 
     ws3 = wb.create_sheet("Notas em aberto")

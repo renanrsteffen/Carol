@@ -34,7 +34,7 @@ Tudo fica na pasta **`dados/`**, dentro da pasta do programa:
 |---|---|
 | **Cliente** (barra lateral) | Crie ou escolha o cliente. Informe o número e a descrição do lote. |
 | **1 · Arquivos** | Envie o **razão** (Excel/CSV), os **extratos** (OFX, Excel, CSV ou PDF) e, se tiver, o **relatório financeiro**. Escolha a conta contábil de cada extrato (fica gravada para os próximos meses). Clique em **Gerar lançamentos**. |
-| **2 · Lançamentos** | Revise. ✅ OK · 🟡 Revisar · 🔴 Pendente · 📗 Já consta no razão. Troque a contrapartida, ajuste o histórico, marque **Memorizar** no que corrigir. |
+| **2 · Lançamentos** | Fila de revisão. Uma linha por movimento do extrato; o que pede atenção vem primeiro, com o motivo em poucas palavras (🔴 precisa de decisão · 🟡 conferir · 🟢 pronto · 📗 já no razão · ⚪ ignorado). Clique na linha: o painel mostra o porquê, o lançamento proposto e as **outras possibilidades encontradas**; escolha, ajuste histórico/NF se quiser e **Confirmar** — a fila segue para o próximo. **Desfazer** volta à sugestão do programa. |
 | **3 · Notas em aberto** | Notas de clientes/fornecedores em aberto no razão e o saldo que fica depois dos extratos. |
 | **4 · Exportar** | Conferência extrato × lançamentos por banco, validação e download do **arquivo SIGER** e da **planilha de conferência**. |
 | **⚙️ Configurações** | Contas de juros/descontos, regras, modelos de histórico, tipo das contas e memória do cliente. |
@@ -72,7 +72,7 @@ Para cada recebimento/pagamento o programa testa, nesta ordem, e escolhe a hipó
 | **Pagamento parcial** | nota 1.000,00, pago 427,13 | baixa 427,13; o resto continua em aberto |
 | **Notas mais antigas** | valor cobre as mais antigas e parte da seguinte | baixa em ordem de data |
 
-Notas emitidas depois da data do pagamento não são consideradas. Hipóteses menos seguras (parcela, juros, parcial, busca sem nome) ficam como **Revisar**.
+Notas emitidas depois da data do pagamento não são consideradas. Hipóteses menos seguras (parcela, juros, parcial, busca sem nome) ficam como **Conferir** (🟡). Quando duas contas são igualmente prováveis, o programa não escolhe: deixa 🔴 e mostra as opções para o operador decidir. As decisões do operador são reaplicadas sempre que a classificação é refeita, e as notas escolhidas não são usadas de novo em outro movimento.
 
 ### Históricos
 

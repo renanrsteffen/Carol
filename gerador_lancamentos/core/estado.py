@@ -12,7 +12,7 @@ def _lista(cls, itens):
     return [cls(**{k: v for k, v in i.items() if k in nomes}) for i in itens or []]
 
 
-def empacotar(*, lancs, movs, titulos_inicio, titulos, razao: Razao | None, totais, financeiro, editados) -> dict:
+def empacotar(*, lancs, movs, titulos_inicio, titulos, razao: Razao | None, totais, financeiro, editados=None, forcados=None) -> dict:
     return {
         "lancs": [asdict(l) for l in lancs],
         "movs": [asdict(m) for m in movs],
@@ -24,6 +24,7 @@ def empacotar(*, lancs, movs, titulos_inicio, titulos, razao: Razao | None, tota
         "totais": {k: list(v) for k, v in (totais or {}).items()},
         "financeiro": [asdict(i) for i in financeiro or []],
         "editados": sorted(editados or []),
+        "forcados": forcados or {},
     }
 
 
@@ -42,6 +43,7 @@ def desempacotar(d: dict) -> dict:
         "totais": {k: tuple(v) for k, v in (d.get("totais") or {}).items()},
         "financeiro_itens": _lista(ItemFinanceiro, d.get("financeiro")),
         "editados": set(d.get("editados") or []),
+        "forcados": d.get("forcados") or {},
     }
 
 
