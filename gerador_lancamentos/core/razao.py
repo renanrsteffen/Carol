@@ -129,6 +129,7 @@ class Razao:
         self.contas: dict[str, Conta] = {}
         self.movimentos: list[MovRazao] = []
         self.avisos: list[str] = []
+        self.saldos_anteriores: dict[str, tuple[float, bool, object]] = {}  # conta -> (valor, sinal explícito, data)
 
     # ------------------------------------------------------------------ carga
     @classmethod
@@ -193,6 +194,19 @@ class Razao:
 
             hist = col("historico")
             data = parse_data(bruta[mapa["data"]] if mapa["data"] < len(bruta) else None, ano_ref)
+            jh = normalizar(hist) or jn
+            if re.match(r"^(SALDO ANTERIOR|SALDO INICIAL)", jh) or re.search(r"\bSALDO ANTERIOR\b", jn[:40]):
+                bruto_saldo = col("saldo") or col("debito") or col("credito") or next(
+                    (c for c in reversed(linha) if parse_valor(c) is not None and re.search(r"\d,\d{2}|\d\.\d{2}|^\d+$", c)), "")
+                v = parse_valor(bruto_saldo)
+                if conta_atual and v:
+                    explicito = bool(re.search(r"[DC]\s*$|^-|-$|\(", str(bruto_saldo).strip().upper()))
+                    if col("credito") and not col("saldo") and not col("debito"):
+                        v, explicito = abs(v), True
+                    elif col("debito") and not col("saldo"):
+                        v, explicito = -abs(v), True
+                    self.saldos_anteriores[conta_atual] = (v, explicito, data)
+                continue
             deb = parse_valor(col("debito")) or 0.0
             cred = parse_valor(col("credito")) or 0.0
 
@@ -361,6 +375,8 @@ def apurar_titulos(razao: Razao, tipos_override: dict[str, str] | None = None) -
     for m in razao.movimentos:
         por_conta[m.conta].append(m)
 
+    for cod in razao.saldos_anteriores:
+        por_conta.setdefault(cod, [])
     for cod, movs in por_conta.items():
         conta = razao.contas.get(cod)
         tipo = tipos_override.get(cod) or (conta.tipo if conta else "")
@@ -368,6 +384,15 @@ def apurar_titulos(razao: Razao, tipos_override: dict[str, str] | None = None) -
             continue
         movs = sorted(movs, key=lambda x: x.data)
         lista: list[Titulo] = []
+        if cod in razao.saldos_anteriores:
+            v, explicito, d = razao.saldos_anteriores[cod]
+            # saldo devedor (D, negativo) é natural de cliente; credor (C, positivo) de fornecedor
+            natural = (v > 0) if tipo == "fornecedor" else (v < 0)
+            if abs(v) > 0.009 and (natural or not explicito):
+                data_ini = d or (movs[0].data if movs else None)
+                if data_ini:
+                    lista.append(Titulo(cod, conta.nome if conta else cod, tipo, "", data_ini, abs(v), abs(v),
+                                        "SALDO ANTERIOR (SEM DETALHE DAS NOTAS)"))
         baixas: list[MovRazao] = []
         for m in movs:
             constitui = m.credito if tipo == "fornecedor" else m.debito

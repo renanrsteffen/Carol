@@ -20,10 +20,17 @@ from datetime import timedelta
 
 from rapidfuzz import fuzz
 
+from .busca import Candidato, buscar, melhor_entre_contas
 from .modelos import Conta, ItemFinanceiro, Lancamento, Movimento, MovRazao, Titulo
-from .perfil import RUIDO_BANCARIO, Perfil, Regra, chave_memoria
+from .perfil import MODELOS_PADRAO, RUIDO_BANCARIO, Perfil, Regra, chave_memoria
 from .razao import Razao
 from .util import extrair_nfs, nf_chave, normalizar, tokens
+
+ROTULO_BUSCA = {
+    "nf": "NF citada", "exato": "valor da nota", "soma": "soma de notas", "retencao": "nota com retenção",
+    "parcela": "parcela", "juros": "nota + juros", "desconto": "nota com desconto", "parcial": "pagamento parcial",
+    "peps": "notas mais antigas",
+}
 
 MESES = ["JAN", "FEV", "MAR", "ABR", "MAI", "JUN", "JUL", "AGO", "SET", "OUT", "NOV", "DEZ"]
 
@@ -153,34 +160,12 @@ class Classificador:
     def titulos_abertos(self, conta: str) -> list[Titulo]:
         return sorted((t for t in self.titulos if t.conta == conta and t.aberto), key=lambda t: t.data)
 
-    def casar_titulos(self, conta: str, valor: float, nfs_sugeridas: list[str] | None = None):
-        """Retorna (titulos, diferença) que explicam o valor pago/recebido.
-        diferença > 0: pago a mais (juros); < 0: pago a menos (desconto/parcial)."""
-        abertos = self.titulos_abertos(conta)
-        if not abertos:
-            return [], valor
-        if nfs_sugeridas:
-            sel = [t for t in abertos if set(t.nf.split("/")) & set(nfs_sugeridas)]
-            if sel:
-                return sel, round(valor - sum(t.saldo for t in sel), 2)
-        for t in abertos:
-            if abs(t.saldo - valor) < 0.01:
-                return [t], 0.0
-        candidatos = abertos[:14]
-        for n in range(2, min(5, len(candidatos)) + 1):
-            for comb in itertools.combinations(candidatos, n):
-                if abs(sum(t.saldo for t in comb) - valor) < 0.01:
-                    return list(comb), 0.0
-        tol = self.perfil.tolerancia_juros_pct / 100
-        melhor = None
-        for t in abertos:
-            dif = valor - t.saldo
-            if abs(dif) <= max(0.5, t.saldo * tol):
-                if melhor is None or abs(dif) < abs(melhor[1]):
-                    melhor = ([t], round(dif, 2))
-        if melhor:
-            return melhor
-        return [], valor
+    def titulos_por_conta(self, tipo: str) -> dict[str, list[Titulo]]:
+        d: dict[str, list[Titulo]] = defaultdict(list)
+        for t in self.titulos:
+            if t.aberto and t.tipo == tipo:
+                d[t.conta].append(t)
+        return d
 
     # ------------------------------------------------------------------ principal
     def classificar(self, movimentos: list[Movimento]) -> list[Lancamento]:
@@ -264,105 +249,114 @@ class Classificador:
                                status="revisar" if conf < 85 else "ok", origem="Semelhança com o razão",
                                confianca=conf, observacao=f"Parecido com: {hist_razao[:60]}")]
 
-        # 7) título de valor único (sem nome)
-        unico = self._titulo_unico_por_valor(mov)
-        if unico:
-            t = unico
-            c = self.contas.get(t.conta)
-            r = self._lancar_parte(mov, c, 60, "Valor igual a nota em aberto")
+        # 7) procura o valor em todos os clientes/fornecedores (nome não identificado)
+        cand, outros = self._buscar_em_todos(mov)
+        if cand:
+            c = self.contas.get(cand.conta)
+            r = self._lancar_parte(mov, c, 75, "Busca nas notas em aberto", candidato=cand)
             if r:
-                for l in r:
-                    l.status = "revisar"
-                    l.observacao = (l.observacao + " Nome não identificado no extrato; confira.").strip()
+                r[0].status = "revisar"
+                r[0].observacao = ("Nome não aparece no extrato. " + r[0].observacao
+                                   + (" | Também possível: " + "; ".join(f"{self.nome_conta(o.conta)}: {o.explicacao}" for o in outros) if outros else ""))
                 return r
+        dica = ("Possíveis: " + "; ".join(f"{self.nome_conta(o.conta)} — {o.explicacao}" for o in outros)) if outros else ""
 
         if parte:
             r = self._lancar_parte(mov, parte, score, "Cliente/fornecedor identificado")
             if r:
                 return r
         return [self._base(mov, historico=self._generico(mov), status="pendente", origem="Não identificado", confianca=0,
-                           observacao="Escolha a conta de contrapartida")]
+                           observacao=dica or "Escolha a conta de contrapartida")]
 
     # ------------------------------------------------------------------ partes / NF
     def _lancar_parte(self, mov: Movimento, conta: Conta, score: int, origem: str, nfs: list[str] | None = None,
-                      nome_parte: str = "") -> list[Lancamento] | None:
+                      nome_parte: str = "", candidato: Candidato | None = None) -> list[Lancamento] | None:
         if conta is None:
             return None
-        valor = round(abs(mov.valor), 2)
-        tipo = conta.tipo
-        if tipo not in ("cliente", "fornecedor"):
-            tipo = "cliente" if mov.entrada else "fornecedor"
         parte = nome_parte or conta.nome
         nfs = nfs or extrair_nfs(mov.descricao)
-        sel, dif = self.casar_titulos(conta.codigo, valor, nfs)
         pagando = not mov.entrada
-        if not sel:
-            chave = "pagamento_fornecedor" if pagando else "recebimento_cliente"
+        if candidato is None:
+            cands = buscar(self.titulos_abertos(conta.codigo), mov.valor, mov.data, nfs, self.perfil.tolerancia_juros_pct)
+            candidato = cands[0] if cands else None
+            alternativas = cands[1:3]
+        else:
+            alternativas = []
+        chave = "pagamento_fornecedor" if pagando else "recebimento_cliente"
+
+        if candidato is None:
             nf_txt = ", ".join(nfs) if nfs else ""
-            if nf_txt:
-                hist = self._modelo(chave + "_nf", nf=nf_txt, parte=parte)
-            else:
-                hist = self._modelo(chave, parte=parte, nf="")
+            hist = self._modelo(chave + ("_nf" if nf_txt else ""), nf=nf_txt, parte=parte)
             abertos = self.titulos_abertos(conta.codigo)
-            obs = "Nenhuma nota em aberto com esse valor" + (
-                f" ({len(abertos)} em aberto: " + ", ".join(f"NF {t.nf or 's/n'} {t.saldo:.2f}" for t in abertos[:4]) + ")" if abertos else "")
+            obs = ("Nenhuma nota em aberto no razão para " + parte if not abertos else
+                   f"Nenhuma combinação das {len(abertos)} notas em aberto explica o valor: "
+                   + ", ".join(f"NF {t.nf or 's/n'} {t.saldo:.2f}" for t in abertos[:5]))
             return [self._base(mov, conta_contra=conta.codigo, historico=hist, nf=nf_txt, parte=parte,
                                status="revisar", origem=origem, confianca=min(score, 70), observacao=obs)]
 
-        nf_txt = ", ".join(t.nf for t in sel if t.nf)
-        chave = ("pagamento_fornecedor" if pagando else "recebimento_cliente") + ("_nf" if nf_txt else "")
-        saldo_sel = round(sum(t.saldo for t in sel), 2)
-        conta_dif, chave_dif = self._conta_diferenca(pagando, dif)
-        hist = self._modelo(chave, nf=nf_txt, parte=parte)
+        c = candidato
+        nf_hist = c.nf_texto
+        if c.tipo == "parcela" and nf_hist:
+            nf_hist = f"{nf_hist} PARC. {c.parcela}"
+        elif c.tipo == "parcial" and nf_hist:
+            nf_hist = f"{nf_hist} (PARCIAL)"
+        hist = self._modelo(chave + ("_nf" if nf_hist else ""), nf=nf_hist, parte=parte)
+        conf = min(score, c.pontos)
+        status = "ok" if conf >= 85 and c.tipo in ("nf", "exato", "soma") else "revisar"
+        obs = c.explicacao
+        if alternativas:
+            obs += " | Outras hipóteses: " + "; ".join(a.explicacao for a in alternativas)
+        valor = round(abs(mov.valor), 2)
         out: list[Lancamento] = []
-        ok = "ok" if score >= 85 else "revisar"
+        conta_juros, chave_juros = self._conta_diferenca(pagando, 1)
+        conta_desc, chave_desc = self._conta_diferenca(pagando, -1)
 
-        if not dif:
-            out.append(self._base(mov, conta_contra=conta.codigo, historico=hist, nf=nf_txt, parte=parte,
-                                  status=ok, origem=origem, confianca=score))
-            for t in sel:
-                t.saldo = 0.0
-            return out
-
-        if dif > 0:  # pagou/recebeu a mais que o saldo das notas: juros/multa
-            if conta_dif:
-                out.append(self._base(mov, valor=saldo_sel, conta_contra=conta.codigo, historico=hist, nf=nf_txt,
-                                      parte=parte, status=ok, origem=origem, confianca=score))
-                out.append(self._base(mov, valor=round(dif, 2), conta_contra=conta_dif,
-                                      historico=self._modelo(chave_dif, nf=nf_txt, parte=parte), nf=nf_txt, parte=parte,
-                                      status="revisar", origem=origem + " (juros)", confianca=70,
-                                      observacao=f"Valor {dif:.2f} acima do saldo da nota: lançado como juros"))
+        # linha principal (banco x cliente/fornecedor)
+        principal = valor
+        if c.juros > 0 and conta_juros:
+            principal = round(valor - c.juros, 2)
+        out.append(self._base(mov, valor=principal, conta_contra=conta.codigo, historico=hist, nf=c.nf_texto,
+                              parte=parte, status=status, origem=f"{origem} · {ROTULO_BUSCA.get(c.tipo, c.tipo)}",
+                              confianca=conf, observacao=obs))
+        if c.juros > 0:
+            if conta_juros:
+                out.append(self._base(mov, valor=c.juros, conta_contra=conta_juros,
+                                      historico=self._modelo(chave_juros, nf=c.nf_texto, parte=parte), nf=c.nf_texto,
+                                      parte=parte, status="revisar", origem=origem + " · juros", confianca=70,
+                                      observacao=f"{c.juros:.2f} acima do saldo da nota"))
             else:
-                out.append(self._base(mov, conta_contra=conta.codigo, historico=hist, nf=nf_txt, parte=parte,
-                                      status="revisar", origem=origem, confianca=min(score, 75),
-                                      observacao=f"Valor {dif:.2f} acima do saldo da nota (juros?). Configure a conta de juros para separar."))
-            for t in sel:
-                t.saldo = 0.0
-            return out
-
-        # pagou/recebeu a menos: desconto (se configurado) ou pagamento parcial
-        falta = round(-dif, 2)
-        out.append(self._base(mov, conta_contra=conta.codigo, historico=hist, nf=nf_txt, parte=parte,
-                              status="revisar", origem=origem, confianca=min(score, 75),
-                              observacao=f"Valor {falta:.2f} abaixo do saldo da nota"
-                                         + (": desconto lançado à parte" if conta_dif else " (desconto ou pagamento parcial?)")))
-        if conta_dif:
-            # lançamento sem banco: fornecedor x desconto obtido / desconto concedido x cliente
-            out.append(Lancamento(
-                mov_id=mov.id, data=mov.data, conta_banco=conta.codigo, valor=falta,
-                natureza="entrada" if pagando else "saida",   # D fornecedor / C cliente
-                conta_contra=conta_dif, historico=self._modelo(chave_dif, nf=nf_txt, parte=parte), nf=nf_txt,
-                descricao_extrato=mov.descricao, confianca=70, origem=origem + " (desconto)", status="revisar",
-                observacao="Lançamento sem movimento bancário (baixa do desconto)", parte=parte))
-            for t in sel:
-                t.saldo = 0.0
-        else:
-            restante = abs(mov.valor)
-            for t in sel:
-                usado = min(t.saldo, restante)
-                t.saldo = round(t.saldo - usado, 2)
-                restante = round(restante - usado, 2)
+                out[0].observacao += " | Configure a conta de juros para separar a diferença."
+        # lançamentos sem banco: desconto e retenções
+        if c.desconto > 0:
+            if conta_desc:
+                out.append(self._sem_banco(mov, conta.codigo, conta_desc, c.desconto, pagando,
+                                           self._modelo(chave_desc, nf=c.nf_texto, parte=parte), c, parte, "desconto"))
+            else:
+                out[0].observacao += " | Configure a conta de descontos para baixar a diferença."
+        for nome, v in c.retencoes:
+            conta_ret = self._conta_retencao(nome, pagando)
+            h = formatar(self.perfil.modelos.get("retencao", MODELOS_PADRAO["retencao"]), imposto=nome.split()[0],
+                         nf=c.nf_texto, parte=parte)
+            if conta_ret:
+                out.append(self._sem_banco(mov, conta.codigo, conta_ret, v, pagando, h, c, parte, "retenção"))
+            else:
+                out[0].observacao += f" | {nome}: {v:.2f} (configure a conta de {nome.split()[0]} retido)"
+        c.aplicar()
         return out
+
+    def _sem_banco(self, mov, conta_parte, conta_contra, valor, pagando, hist, c, parte, rotulo) -> Lancamento:
+        """Fornecedor: D fornecedor / C conta (desconto obtido, imposto a recolher).
+        Cliente: D conta (desconto concedido, imposto a recuperar) / C cliente."""
+        return Lancamento(
+            mov_id=mov.id, data=mov.data, conta_banco=conta_parte, valor=round(valor, 2),
+            natureza="entrada" if pagando else "saida", conta_contra=conta_contra, historico=hist,
+            nf=c.nf_texto, descricao_extrato=mov.descricao, confianca=75, origem=f"Baixa de {rotulo}",
+            status="revisar", observacao=f"Lançamento sem movimento bancário ({rotulo})", parte=parte)
+
+    def _conta_retencao(self, nome: str, pagando: bool) -> str:
+        chave = nome.split()[0].upper()
+        cfg = self.perfil.contas_retencao.get(chave) or {}
+        return cfg.get("fornecedor" if pagando else "cliente", "")
 
     def _conta_diferenca(self, pagando: bool, dif: float):
         if not dif:
@@ -372,14 +366,10 @@ class Classificador:
             return (p.conta_juros_pagos or None, "juros_pagos") if dif > 0 else (p.conta_desconto_obtido or None, "desconto_obtido")
         return (p.conta_juros_recebidos or None, "juros_recebidos") if dif > 0 else (p.conta_desconto_concedido or None, "desconto_concedido")
 
-    def _titulo_unico_por_valor(self, mov: Movimento) -> Titulo | None:
+    def _buscar_em_todos(self, mov: Movimento):
         tipo = "cliente" if mov.entrada else "fornecedor"
-        v = round(abs(mov.valor), 2)
-        cands = [t for t in self.titulos if t.aberto and t.tipo == tipo and abs(t.saldo - v) < 0.01]
-        contas = {t.conta for t in cands}
-        if len(contas) == 1 and len(cands) >= 1:
-            return cands[0]
-        return None
+        return melhor_entre_contas(self.titulos_por_conta(tipo), mov.valor, mov.data, extrair_nfs(mov.descricao),
+                                   self.perfil.tolerancia_juros_pct)
 
     # ------------------------------------------------------------------ financeiro
     def _casar_financeiro(self, mov: Movimento) -> list[ItemFinanceiro]:
@@ -490,7 +480,7 @@ def formatar(modelo: str, **kw) -> str:
     if not modelo:
         return ""
     vals = {k: (v or "") for k, v in kw.items()}
-    for k in ("nf", "parte", "descricao", "banco", "mes"):
+    for k in ("nf", "parte", "descricao", "banco", "mes", "imposto"):
         vals.setdefault(k, "")
     try:
         txt = modelo.format(**vals)

@@ -4,12 +4,29 @@ Transforma **extratos bancários** (e, se houver, o **relatório financeiro** do
 
 ## Como instalar e abrir
 
-1. Instale o Python 3.10 ou superior (https://www.python.org — no Windows marque **"Add Python to PATH"**).
+1. Instale o Python 3.12 (3.11 ou superior) (https://www.python.org — no Windows marque **"Add Python to PATH"**).
 2. Copie a pasta `gerador_lancamentos` para o computador.
 3. Dê dois cliques em **`iniciar.bat`** (Windows) ou rode `./iniciar.sh` (Mac/Linux).
    Na primeira vez ele instala o que precisa (alguns minutos); depois abre direto no navegador.
 
-O programa roda no próprio computador: nenhum arquivo do cliente é enviado para a internet.
+O programa roda no próprio computador: nenhum arquivo do cliente é enviado para a internet, e depois de instalado funciona sem internet. As versões das bibliotecas estão fixadas em `requirements.txt`, então atualizações externas não quebram o programa.
+
+## Onde ficam os dados e backup
+
+Tudo fica na pasta **`dados/`**, dentro da pasta do programa:
+
+| Pasta | Conteúdo |
+|---|---|
+| `dados/clientes` | perfil de cada cliente: contas, regras, modelos de histórico e tudo que o programa aprendeu |
+| `dados/trabalhos` | o trabalho de cada mês, **salvo automaticamente a cada alteração**; ao escolher o cliente, o último trabalho reabre sozinho |
+| `dados/exportados` | cópia de cada arquivo baixado para o SIGER e de cada conferência |
+| `dados/backups` | backups compactados (.zip) |
+
+- **Backup automático** uma vez por dia, ao abrir o programa (mantém os últimos 60; ajustável).
+- **Cópia extra**: na aba 🛟 Backup, informe uma pasta do OneDrive/Google Drive ou um pendrive; cada backup também é copiado para lá. **Recomendado** — se o computador quebrar, os dados estão lá.
+- **Restaurar**: na mesma aba, envie o .zip. Antes de restaurar, o programa guarda um backup do estado atual.
+- Gravação segura: cada arquivo é gravado primeiro em um temporário e só depois substitui o original, que vira `.bak`. Se um arquivo corromper (queda de energia), o programa usa o `.bak` automaticamente.
+- Para levar o programa para outro computador: copie a pasta inteira (incluindo `dados/`), ou instale de novo e restaure um backup.
 
 ## Passo a passo
 
@@ -31,15 +48,31 @@ Para cada linha do extrato, nesta ordem:
 1. **Já está no razão?** Mesma conta de banco, valor e data (±1 dia) → marcada como *Já lançado* e fica fora da exportação (evita duplicidade). Esses lançamentos também ensinam o programa.
 2. **Memória do cliente**: o que você corrigiu e marcou *Memorizar* em meses anteriores.
 3. **Relatório financeiro**: casa por data e valor (inclusive um pagamento em lote que soma vários títulos) e usa o favorecido e o nº da nota do relatório. Um pagamento em lote vira um lançamento por nota.
-4. **Cliente/fornecedor**: identifica pelo CNPJ ou pelo nome no extrato e procura a nota em aberto:
-   - nota com o mesmo valor; ou
-   - soma de até 5 notas do mesmo cliente/fornecedor; ou
-   - nota com diferença até a tolerância → separa **juros/multa** (se a conta estiver configurada) ou marca para revisar (desconto/pagamento parcial).
-   A nota usada é baixada, então não é vinculada duas vezes.
+4. **Cliente/fornecedor**: identifica pelo CNPJ ou pelo nome no extrato e **procura o pagamento nas notas em aberto da conta dele no razão** (veja abaixo). A nota usada é baixada, então não é vinculada duas vezes; a próxima parcela da mesma nota é reconhecida como a seguinte.
 5. **Regras de categoria**: tarifa bancária, IOF, juros bancários, aplicação, resgate, rendimento, telefone/internet, energia, água, DAS, DARF, INSS, FGTS, ICMS/ISS, folha, empréstimo, cartão. **A conta de cada regra é descoberta no razão** (a contrapartida que você mais usou em históricos daquele tipo). Também pode fixar a conta em Configurações.
 6. **Semelhança com o razão**: compara o texto do extrato com os históricos já lançados.
-7. **Nota em aberto com valor único**: se só uma nota em aberto tem aquele valor, sugere e marca para revisar.
+7. **Busca em todos os clientes/fornecedores**: se o nome não aparece no extrato, procura o valor (nota, soma, parcela, retenção) em todas as contas. Só sugere quando uma conta se destaca; se houver empate, lista as possibilidades na observação.
 8. Sem nada disso → **Pendente** para você escolher a conta.
+
+### Como o pagamento é procurado nas notas em aberto
+
+As notas em aberto vêm do razão: cada nota lançada na conta do cliente/fornecedor menos as baixas (pelo nº da nota no histórico; sem número, por valor igual e depois pela mais antiga). O **saldo anterior** da conta, quando o razão não traz o detalhe das notas antigas, entra como um título "saldo anterior".
+
+Para cada recebimento/pagamento o programa testa, nesta ordem, e escolhe a hipótese mais forte (as outras aparecem na observação):
+
+| Hipótese | Exemplo | Resultado |
+|---|---|---|
+| **NF citada** no extrato ou no relatório financeiro | "PIX REF NF 1002" | baixa essa nota (inteira, parcela ou parcial) |
+| **Valor da nota** | saldo 2.300,00 = pago 2.300,00 | baixa a nota |
+| **Soma de notas** (até 6) | 870,50 + 1.129,50 = 2.000,00 | uma linha, histórico com todas as notas |
+| **Nota com impostos retidos** | 10.000,00 − IRRF 1,5% − PIS/COFINS/CSLL 4,65% = 9.385,00 | baixa a nota cheia e gera os lançamentos das retenções (IRRF, PIS, COFINS, CSLL, ISS 2–5%, INSS 11%) |
+| **Parcela** (2 a 24 vezes) | nota 3.000,00, pago 1.000,00 | "PARC. 1/3"; no mês seguinte reconhece a 2/3 |
+| **Nota + juros/multa** | nota 1.000,00, pago 1.021,50 | separa 21,50 de juros (se a conta estiver configurada) |
+| **Nota com desconto** | nota 1.000,00, pago 990,00 | baixa a nota e lança o desconto |
+| **Pagamento parcial** | nota 1.000,00, pago 427,13 | baixa 427,13; o resto continua em aberto |
+| **Notas mais antigas** | valor cobre as mais antigas e parte da seguinte | baixa em ordem de data |
+
+Notas emitidas depois da data do pagamento não são consideradas. Hipóteses menos seguras (parcela, juros, parcial, busca sem nome) ficam como **Revisar**.
 
 ### Históricos
 
@@ -49,6 +82,8 @@ Formais e em maiúsculas, com o número da nota quando houver. Padrões (editáv
 - `VLR. RECEBIDO REF. NF 89 - ALFA COMERCIO DE ALIMENTOS LTDA`
 - `VLR. REF. TARIFA BANCÁRIA CONF. EXTRATO`
 - `VLR. REF. APLICAÇÃO FINANCEIRA`
+- `VLR. RECEBIDO REF. NF 123 PARC. 2/3 - CLIENTE X`
+- `VLR. IRRF RETIDO S/ NF 20 - CLIENTE X`
 
 ## Arquivos aceitos
 
@@ -69,11 +104,14 @@ app.py                  interface (Streamlit)
 core/razao.py           leitura do razão e do plano; apuração das notas em aberto
 core/extratos.py        leitura de OFX, Excel/CSV e PDF
 core/financeiro.py      leitura do relatório financeiro
-core/classificador.py   motor de classificação e vínculo com notas
+core/classificador.py   motor de classificação
+core/busca.py           busca do pagamento nas notas em aberto (parcela, retenção, soma, juros...)
+core/armazenamento.py   pasta dados/, gravação segura, trabalhos salvos e backups
+core/estado.py          salvar/abrir o trabalho do mês
 core/perfil.py          perfil do cliente, regras padrão, modelos de histórico, memória
 core/exportar.py        arquivo SIGER e planilha de conferência
 exemplos/               gerador de dados fictícios para teste
 tests/                  testes automáticos (python -m pytest)
 ```
 
-Os perfis dos clientes ficam em `clientes/*.json` (não vão para o Git).
+A pasta `dados/` não vai para o Git (são dados dos clientes).

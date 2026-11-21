@@ -3,6 +3,10 @@ primaryColor = "#1F3864"
 
 [server]
 maxUploadSize = 200
+address = "localhost"
 
 [browser]
 gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"

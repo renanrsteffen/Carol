@@ -6,13 +6,15 @@ from __future__ import annotations
 
 import copy
 from dataclasses import asdict
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
+from core import armazenamento as arm
 from core.classificador import Classificador, Contexto
+from core.estado import competencia, desempacotar, empacotar
 from core.exportar import ROTULO_STATUS, gerar_conferencia, gerar_siger, validar
 from core.extratos import ler_extrato
 from core.financeiro import ler_financeiro
@@ -39,9 +41,39 @@ def init():
     SS.setdefault("totais", {})
     SS.setdefault("versao", 0)
     SS.setdefault("editados", set())
+    SS.setdefault("salvo_em", None)
+    if "backup_feito" not in SS:
+        SS.backup_feito = True
+        try:
+            arm.backup_automatico()
+        except OSError as e:
+            st.warning(f"Não foi possível fazer o backup automático: {e}")
 
 
 init()
+
+
+def salvar_trabalho_atual():
+    """Grava o trabalho do mês em dados/trabalhos (chamado após cada alteração)."""
+    if not SS.perfil or not SS.lancs:
+        return
+    try:
+        arm.salvar_trabalho(SS.perfil.nome, competencia(SS.lancs), empacotar(
+            lancs=SS.lancs, movs=SS.movs, titulos_inicio=SS.titulos_inicio, titulos=SS.titulos, razao=SS.razao,
+            totais=SS.totais, financeiro=SS.get("financeiro_itens", []), editados=SS.editados))
+        SS.salvo_em = datetime.now()
+    except OSError as e:
+        st.error(f"Erro ao salvar o trabalho: {e}")
+
+
+def abrir_trabalho(nome_cliente: str, comp: str):
+    d = arm.carregar_trabalho(nome_cliente, comp)
+    if not d:
+        st.error("Não consegui abrir esse trabalho.")
+        return
+    SS.update(desempacotar(d))
+    SS.salvo_em = d.get("_salvo_em")
+    SS.versao += 1
 
 
 def rotulo(cod: str) -> str:
@@ -82,7 +114,10 @@ with st.sidebar:
                 st.rerun()
     elif SS.perfil is None or SS.perfil.nome != escolha:
         SS.perfil = Perfil.carregar(escolha)
-        SS.lancs, SS.titulos, SS.razao = [], [], None
+        SS.lancs, SS.titulos, SS.titulos_inicio, SS.razao, SS.movs, SS.salvo_em = [], [], [], None, [], None
+        trabalhos = arm.listar_trabalhos(escolha)
+        if trabalhos:  # reabre automaticamente o trabalho mais recente
+            abrir_trabalho(escolha, trabalhos[0][0])
 
     perfil: Perfil | None = SS.perfil
     if perfil:
@@ -94,6 +129,16 @@ with st.sidebar:
             perfil.salvar()
             st.toast("Cliente salvo")
         st.caption(f"{len(perfil.memoria)} históricos memorizados · {len(perfil.apelidos)} nomes · {len(perfil.cnpj_conta)} CNPJs")
+        trabalhos = arm.listar_trabalhos(perfil.nome)
+        if trabalhos:
+            st.divider()
+            rot = {f"{c[5:7]}/{c[:4]}  (salvo {dt:%d/%m %H:%M})": c for c, dt in trabalhos}
+            esc_t = st.selectbox("Trabalhos salvos", list(rot))
+            if st.button("📂 Abrir trabalho", width="stretch"):
+                abrir_trabalho(perfil.nome, rot[esc_t])
+                st.rerun()
+        if SS.salvo_em:
+            st.caption(f"💾 Trabalho salvo automaticamente às {SS.salvo_em:%H:%M:%S}")
 
 if not SS.perfil:
     st.header("Gerador de Lançamentos Contábeis")
@@ -110,8 +155,8 @@ if not SS.perfil:
     st.stop()
 
 perfil: Perfil = SS.perfil
-aba_arq, aba_lanc, aba_notas, aba_exp, aba_cfg = st.tabs(
-    ["1 · Arquivos", "2 · Lançamentos", "3 · Notas em aberto", "4 · Exportar", "⚙️ Configurações"])
+aba_arq, aba_lanc, aba_notas, aba_exp, aba_cfg, aba_bkp = st.tabs(
+    ["1 · Arquivos", "2 · Lançamentos", "3 · Notas em aberto", "4 · Exportar", "⚙️ Configurações", "🛟 Backup"])
 
 
 # ------------------------------------------------------------------------------------ 1. arquivos
@@ -147,6 +192,7 @@ def processar(razoes, plano, extratos_cfg, financeiros, manter_editados=False):
     SS.update(lancs=novos, titulos=titulos, titulos_inicio=titulos_inicio, razao=razao, movs=movs, totais=totais,
               contas_regra=clf.contas_regra, financeiro_itens=itens)
     SS.versao += 1
+    salvar_trabalho_atual()
 
 
 with aba_arq:
@@ -224,7 +270,7 @@ with aba_arq:
         with st.spinner("Lendo, cruzando notas e classificando..."):
             processar(razoes, plano, extratos_cfg, financeiros)
             perfil.salvar()
-        st.success(f"{len(SS.lancs)} lançamentos gerados. Vá para a aba **2 · Lançamentos**.")
+        st.success(f"{len(SS.lancs)} lançamentos gerados e trabalho salvo no computador. Vá para a aba **2 · Lançamentos**.")
 
 
 # ----------------------------------------------------------------------------------- 2. lançamentos
@@ -275,6 +321,7 @@ def aplicar_edicao(key: str, indices: list[int]):
     if mudou:
         perfil.salvar()
         SS.versao += 1
+        salvar_trabalho_atual()
 
 
 with aba_lanc:
@@ -337,6 +384,7 @@ with aba_lanc:
             novos.sort(key=lambda l: (l.data, l.conta_banco, l.mov_id))
             SS.lancs, SS.titulos = novos, clf.titulos
             SS.versao += 1
+            salvar_trabalho_atual()
             st.rerun()
 
 
@@ -411,15 +459,18 @@ with aba_exp:
         para_exportar = [l for l in exp if l.conta_contra and l.conta_banco] if so_ok else exp
         pode = not erros or so_ok
         periodo = max(l.data for l in lancs).strftime("%m_%Y")
-        nome_cli = Perfil.arquivo(perfil.nome).stem
+        nome_cli = arm.nome_seguro(perfil.nome)
         c1, c2 = st.columns(2)
-        c1.download_button("⬇️ Baixar importação SIGER (.xlsx)",
-                           data=gerar_siger(para_exportar, perfil.lote, perfil.descricao_lote) if pode else b"",
-                           file_name=f"Importacao_SIGER_{nome_cli}_{periodo}.xlsx", disabled=not pode,
-                           type="primary", width="stretch")
-        c2.download_button("⬇️ Baixar planilha de conferência",
-                           data=gerar_conferencia(lancs, SS.titulos, nomes, SS.totais),
-                           file_name=f"Conferencia_{nome_cli}_{periodo}.xlsx", width="stretch")
+        nome_siger = f"Importacao_SIGER_{nome_cli}_{periodo}.xlsx"
+        nome_conf = f"Conferencia_{nome_cli}_{periodo}.xlsx"
+        dados_siger = gerar_siger(para_exportar, perfil.lote, perfil.descricao_lote) if pode else b""
+        dados_conf = gerar_conferencia(lancs, SS.titulos, nomes, SS.totais)
+        c1.download_button("⬇️ Baixar importação SIGER (.xlsx)", data=dados_siger, file_name=nome_siger,
+                           disabled=not pode, type="primary", width="stretch",
+                           on_click=arm.guardar_exportado, args=(perfil.nome, nome_siger, dados_siger))
+        c2.download_button("⬇️ Baixar planilha de conferência", data=dados_conf, file_name=nome_conf,
+                           width="stretch", on_click=arm.guardar_exportado, args=(perfil.nome, nome_conf, dados_conf))
+        st.caption(f"Uma cópia de cada arquivo baixado fica guardada em `{arm.PASTA_EXPORTADOS / arm.nome_seguro(perfil.nome)}`.")
 
 
 # ------------------------------------------------------------------------------------ configurações
@@ -442,6 +493,16 @@ with aba_cfg:
     with b:
         perfil.conta_juros_recebidos = sel_conta("Juros recebidos", perfil.conta_juros_recebidos, "cfg_jr")
         perfil.conta_desconto_concedido = sel_conta("Descontos concedidos", perfil.conta_desconto_concedido, "cfg_dc")
+    st.markdown("**Impostos retidos** — quando o cliente paga a nota descontando IRRF, PIS/COFINS/CSLL, ISS ou INSS "
+                "(ou quando a empresa retém ao pagar o fornecedor), o programa reconhece o valor líquido e baixa a nota cheia. "
+                "Informe as contas para ele gerar os lançamentos das retenções.")
+    ret_cols = st.columns(3)
+    for i, imp in enumerate(["IRRF", "PIS", "COFINS", "CSLL", "ISS", "INSS"]):
+        cfg = dict(perfil.contas_retencao.get(imp) or {})
+        with ret_cols[i % 3]:
+            cfg["cliente"] = sel_conta(f"{imp} retido pelo cliente (a recuperar)", cfg.get("cliente", ""), f"ret_c_{imp}")
+            cfg["fornecedor"] = sel_conta(f"{imp} retido do fornecedor (a recolher)", cfg.get("fornecedor", ""), f"ret_f_{imp}")
+        perfil.contas_retencao[imp] = cfg
     perfil.tolerancia_juros_pct = st.slider("Tolerância de diferença tratada como juros/desconto (%)", 0.0, 30.0,
                                             float(perfil.tolerancia_juros_pct), 0.5)
 
@@ -518,3 +579,47 @@ with aba_cfg:
                     perfil.memoria.pop(r["Texto do extrato"], None)
         perfil.salvar()
         st.success("Configurações salvas. Gere os lançamentos novamente para aplicar.")
+
+
+# ------------------------------------------------------------------------------------------ backup
+with aba_bkp:
+    st.subheader("Onde ficam os dados")
+    st.write(f"Tudo fica neste computador, na pasta `{arm.DADOS}`:")
+    st.markdown("- **clientes** — contas, regras e tudo que o programa aprendeu de cada cliente\n"
+                "- **trabalhos** — o trabalho de cada mês, salvo automaticamente a cada alteração\n"
+                "- **exportados** — cópia de cada arquivo baixado para o SIGER\n"
+                "- **backups** — cópias de segurança compactadas (.zip)")
+    cfg = arm.config()
+    st.caption(f"Último backup: {cfg['ultimo_backup'].replace('T', ' ') or 'nenhum'} · "
+               "um backup automático é feito por dia, ao abrir o programa.")
+
+    st.subheader("Cópia extra (recomendado)")
+    st.write("Escolha uma pasta fora deste computador ou sincronizada na nuvem — por exemplo, a pasta do OneDrive/Google Drive "
+             "ou um pendrive. Cada backup também é copiado para lá.")
+    extra = st.text_input("Pasta extra de backup", cfg["pasta_backup_extra"], placeholder=r"C:\Users\voce\OneDrive\Backup Lancamentos")
+    manter = st.number_input("Quantos backups manter", 5, 1000, int(cfg["manter_backups"]))
+    if st.button("Salvar opções de backup"):
+        cfg.update(pasta_backup_extra=extra.strip(), manter_backups=int(manter))
+        arm.salvar_config(cfg)
+        st.success("Opções salvas.")
+
+    st.subheader("Backup agora")
+    if st.button("🛟 Fazer backup agora", type="primary"):
+        z = arm.fazer_backup("manual")
+        st.success(f"Backup criado: {z.name}")
+    backups = arm.listar_backups()
+    if backups:
+        ult = backups[0]
+        st.download_button(f"⬇️ Baixar o backup mais recente ({ult.name})", data=ult.read_bytes(), file_name=ult.name)
+        st.dataframe(pd.DataFrame([{"Arquivo": b.name, "Data": datetime.fromtimestamp(b.stat().st_mtime).strftime("%d/%m/%Y %H:%M"),
+                                    "Tamanho (KB)": round(b.stat().st_size / 1024, 1)} for b in backups]),
+                     hide_index=True, width="stretch")
+
+    st.subheader("Restaurar")
+    st.write("Envie um arquivo de backup (.zip). Antes de restaurar, o programa guarda um backup do estado atual.")
+    arq_bkp = st.file_uploader("Arquivo de backup", type=["zip"], key="up_bkp")
+    confirma = st.checkbox("Entendo que os dados atuais serão substituídos pelos do backup")
+    if st.button("Restaurar backup", disabled=not (arq_bkp and confirma)):
+        n = arm.restaurar_backup(arq_bkp.getvalue())
+        SS.perfil = None
+        st.success(f"{n} arquivos restaurados. Escolha o cliente novamente na barra lateral.")

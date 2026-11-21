@@ -1,18 +1,17 @@
 """Perfil do cliente: contas, regras, modelos de histórico e o que o programa aprendeu.
 
-Cada cliente fica salvo em clientes/<nome>.json. Tudo que o contador corrige e marca como
+Cada cliente fica salvo em dados/clientes/<nome>.json. Tudo que o contador corrige e marca como
 "memorizar" vira regra para os próximos meses.
 """
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from . import armazenamento as arm
 from .util import normalizar
 
-PASTA = Path(__file__).resolve().parent.parent / "clientes"
 
 # Modelos de histórico. Campos: {nf} {parte} {descricao} {banco} {mes}
 MODELOS_PADRAO = {
@@ -24,6 +23,7 @@ MODELOS_PADRAO = {
     "juros_recebidos": "VLR. JUROS RECEBIDOS S/ NF {nf} - {parte}",
     "desconto_obtido": "VLR. DESCONTO OBTIDO S/ NF {nf} - {parte}",
     "desconto_concedido": "VLR. DESCONTO CONCEDIDO S/ NF {nf} - {parte}",
+    "retencao": "VLR. {imposto} RETIDO S/ NF {nf} - {parte}",
     "generico_saida": "VLR. PAGO REF. {descricao}",
     "generico_entrada": "VLR. RECEBIDO REF. {descricao}",
 }
@@ -95,6 +95,7 @@ class Perfil:
     conta_desconto_obtido: str = ""
     conta_desconto_concedido: str = ""
     tolerancia_juros_pct: float = 10.0                       # diferença máxima (%) tratada como juros/desconto
+    contas_retencao: dict = field(default_factory=dict)      # IRRF/PIS/COFINS/CSLL/ISS/INSS -> {cliente, fornecedor}
     tipos_conta: dict = field(default_factory=dict)          # código -> cliente | fornecedor | banco | outra
     modelos: dict = field(default_factory=lambda: dict(MODELOS_PADRAO))
     regras: list = field(default_factory=lambda: [asdict(r) for r in REGRAS_PADRAO])
@@ -105,21 +106,18 @@ class Perfil:
     # ------------------------------------------------------------------ persistência
     @staticmethod
     def arquivo(nome: str) -> Path:
-        seguro = re.sub(r"[^A-Za-z0-9_-]+", "_", normalizar(nome)).strip("_") or "cliente"
-        return PASTA / f"{seguro}.json"
+        return arm.PASTA_CLIENTES / f"{arm.nome_seguro(nome)}.json"
 
     def salvar(self) -> Path:
-        PASTA.mkdir(parents=True, exist_ok=True)
         p = self.arquivo(self.nome)
-        p.write_text(json.dumps(asdict(self), ensure_ascii=False, indent=2), encoding="utf-8")
+        arm.gravar_json(p, asdict(self))
         return p
 
     @classmethod
     def carregar(cls, nome: str) -> "Perfil":
-        p = cls.arquivo(nome)
-        if not p.exists():
+        dados = arm.ler_json(cls.arquivo(nome))
+        if not dados:
             return cls(nome=nome)
-        dados = json.loads(p.read_text(encoding="utf-8"))
         perfil = cls(**{k: v for k, v in dados.items() if k in cls.__dataclass_fields__})
         # garante novos modelos adicionados em versões futuras
         for k, v in MODELOS_PADRAO.items():
@@ -128,15 +126,15 @@ class Perfil:
 
     @staticmethod
     def listar() -> list[str]:
-        if not PASTA.exists():
+        arm.migrar_pasta_antiga()
+        if not arm.PASTA_CLIENTES.exists():
             return []
         nomes = []
-        for p in sorted(PASTA.glob("*.json")):
-            try:
-                nomes.append(json.loads(p.read_text(encoding="utf-8")).get("nome", p.stem))
-            except Exception:
-                continue
-        return nomes
+        for p in sorted(arm.PASTA_CLIENTES.glob("*.json")):
+            d = arm.ler_json(p)
+            if d:
+                nomes.append(d.get("nome", p.stem))
+        return sorted(nomes, key=str.upper)
 
     # ------------------------------------------------------------------ helpers
     def obter_regras(self) -> list[Regra]:
