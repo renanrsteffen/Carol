@@ -1,0 +1,7 @@
+# dados dos clientes (memória, contas) ficam só no computador do escritório
+clientes/*.json
+exemplos/*.xlsx
+exemplos/*.ofx
+__pycache__/
+.pytest_cache/
+.venv/
