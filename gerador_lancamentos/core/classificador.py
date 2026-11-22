@@ -21,6 +21,7 @@ from datetime import timedelta
 from rapidfuzz import fuzz
 
 from .busca import Candidato, buscar, melhor_entre_contas
+from .tributos import NOMES, conta_banco_do_comprovante, identificar, sugerir_contas
 from .modelos import Conta, ItemFinanceiro, Lancamento, Movimento, MovRazao, Titulo
 from .perfil import MODELOS_PADRAO, RUIDO_BANCARIO, Perfil, Regra, chave_memoria
 from .razao import Razao
@@ -55,6 +56,7 @@ class Contexto:
     financeiro: list[ItemFinanceiro] = field(default_factory=list)
     # decisões do operador por movimento: {conta, nfs, historico, aceito, ignorar}
     forcados: dict = field(default_factory=dict)
+    comprovantes: list = field(default_factory=list)   # comprovantes de pagamento do e-CAC
 
 
 class Classificador:
@@ -72,6 +74,10 @@ class Classificador:
         self.contas_regra = self._aprender_contas_das_regras()
         self._indice_historico = self._montar_indice()
         self.ja_lancados = self._indexar_razao_banco()
+        self.comprovantes = list(ctx.comprovantes or [])
+        sugeridas = sugerir_contas(self.contas)
+        self.contas_tributo = {**sugeridas, **{k: v for k, v in self.perfil.contas_tributo.items() if v}}
+        self.contas_tributo_sugeridas = sugeridas
 
     # ------------------------------------------------------------------ aprendizado
     def _bancos(self) -> set[str]:
@@ -180,6 +186,7 @@ class Classificador:
     def classificar(self, movimentos: list[Movimento]) -> list[Lancamento]:
         saida: list[Lancamento] = []
         usados_razao: set[int] = set()
+        movimentos = list(movimentos) + self._preparar_comprovantes(movimentos)
         for mov in sorted(movimentos, key=lambda m: (m.data, m.valor)):
             f = self.ctx.forcados.get(mov.id)
             ls = self._forcado(mov, f) if f and (f.get("conta") or f.get("ignorar")) else self._classificar_um(mov, usados_razao)
@@ -198,6 +205,163 @@ class Classificador:
                 l.principal = i == 0
             saida.extend(ls)
         return saida
+
+    # ------------------------------------------------------------------ comprovantes e-CAC
+    def _preparar_comprovantes(self, movimentos: list[Movimento]) -> list[Movimento]:
+        """Casa os comprovantes com as saídas do extrato (valor e data; vários DARFs num débito)
+        e cria um movimento próprio para os comprovantes sem linha no extrato."""
+        self._comp_por_mov: dict[str, list] = {}
+        self._sem_extrato: dict[str, str] = {}
+        self._conf_banco: dict[str, int] = {}
+        if not self.comprovantes:
+            return []
+        bancos_extrato = {m.conta_banco for m in movimentos}
+        for c in self.comprovantes:
+            conta, conf = conta_banco_do_comprovante(c.banco, c.agencia, self.perfil, self.contas, bancos_extrato)
+            c._conta_banco, c._conf_banco = conta, conf
+        livres = [c for c in self.comprovantes if c.data_arrecadacao]
+        saidas = sorted((m for m in movimentos if m.valor < 0), key=lambda m: m.data)
+
+        def compat(c, m, dias):
+            return abs((c.data_arrecadacao - m.data).days) <= dias and (not c._conta_banco or c._conf_banco < 90
+                                                                         or c._conta_banco == m.conta_banco)
+        for dias in (0, 2):
+            for m in saidas:
+                if m.id in self._comp_por_mov:
+                    continue
+                v = round(-m.valor, 2)
+                cands = [c for c in livres if compat(c, m, dias)]
+                um = [c for c in cands if abs(c.total - v) < 0.011]
+                if um:
+                    um.sort(key=lambda c: abs((c.data_arrecadacao - m.data).days))
+                    self._comp_por_mov[m.id] = [um[0]]
+                    livres.remove(um[0])
+                    continue
+                if 2 <= len(cands) <= 16:
+                    achou = None
+                    for n in range(2, min(6, len(cands)) + 1):
+                        for comb in itertools.combinations(cands, n):
+                            if abs(sum(c.total for c in comb) - v) < 0.011:
+                                achou = list(comb)
+                                break
+                        if achou:
+                            break
+                    if achou:
+                        self._comp_por_mov[m.id] = achou
+                        for c in achou:
+                            livres.remove(c)
+        extras: list[Movimento] = []
+        for c in self.comprovantes:
+            if any(c in cs for cs in self._comp_por_mov.values()):
+                continue
+            d = c.data_arrecadacao or c.vencimento or c.periodo_apuracao
+            if d is None:
+                continue
+            mov = Movimento(id=c.id, data=d, descricao=f"{c.tipo} {c.numero} - pago no {c.banco_nome or 'banco não informado'} (e-CAC)",
+                            valor=-round(c.total, 2), conta_banco=c._conta_banco)
+            self._comp_por_mov[mov.id] = [c]
+            self._sem_extrato[mov.id] = ("Não encontrado no extrato" if c._conta_banco and c._conta_banco in bancos_extrato
+                                         else "Sem extrato para conferir")
+            extras.append(mov)
+        return extras
+
+    def _lancar_comprovantes(self, mov: Movimento, comps: list) -> list[Lancamento]:
+        out: list[Lancamento] = []
+        sev = {"pendente": 0, "revisar": 1, "ok": 2}
+        alerta = ("ok", "", "")   # (status, motivo, observação) mais grave do movimento
+        todos_obs: list[str] = []
+
+        def piora(status, motivo, obs=""):
+            nonlocal alerta
+            texto = f"{motivo}: {obs}" if motivo and obs else (motivo or obs)
+            if texto and texto not in todos_obs:
+                todos_obs.append(texto)
+            if sev[status] < sev[alerta[0]] or (sev[status] == sev[alerta[0]] and not alerta[1]):
+                alerta = (status, motivo, obs)
+
+        for c in comps:
+            pa, doc = c.pa_texto, c.numero
+            nomes = []
+            linhas_c: list[tuple[str, str, float, str]] = []   # (tributo, conta, valor, historico)
+            if c.tipo == "DAS":
+                linhas_c.append(("SIMPLES", self.contas_tributo.get("SIMPLES", ""), c.principal,
+                                 self._modelo("imposto_pago", tributo=NOMES["SIMPLES"], pa=pa, doc=doc)))
+                nomes.append("SIMPLES NACIONAL")
+            else:
+                for it in c.itens:
+                    trib, recorrente = identificar(it.codigo, it.denominacao, c.tipo)
+                    nome = NOMES.get(trib) if trib != "OUTROS" else (descricao_curta(it.denominacao)[:45] or "TAXA/IMPOSTO")
+                    nomes.append(nome)
+                    if not it.principal:
+                        continue
+                    if recorrente:
+                        conta = self.contas_tributo.get(trib, "")
+                        hist = self._modelo("imposto_pago", tributo=nome, pa=pa, doc=doc)
+                        if not conta:
+                            piora("pendente", f"Conta de {NOMES.get(trib, trib)} a recolher não definida",
+                                  "Informe a conta em Configurações › Impostos")
+                        else:
+                            prov = self._provisao(conta, c.periodo_apuracao)
+                            if prov is not None and abs(prov - it.principal) > 0.01:
+                                piora("revisar", "Valor ≠ provisão" if prov else "Sem provisão no razão",
+                                      f"{nome} PA {pa}: pago {br(it.principal)}, provisionado {br(prov)}")
+                    else:
+                        conta = self.contas_tributo.get("OUTROS", "")
+                        hist = self._modelo("imposto_esporadico", tributo=nome, pa=pa, doc=doc)
+                        piora("revisar" if conta else "pendente", "Taxa/imposto esporádico → despesa",
+                              f"Código {it.codigo or 's/c'} {it.denominacao[:60]}")
+                    linhas_c.append((trib, conta, it.principal, hist))
+            tribs = ", ".join(dict.fromkeys(nomes))[:60]
+            if c.multa:
+                linhas_c.append(("MULTA", self.contas_tributo.get("MULTA", ""), c.multa,
+                                 self._modelo("multa_tributo", tributo=tribs, pa=pa, doc=doc)))
+                if not self.contas_tributo.get("MULTA"):
+                    piora("pendente", "Conta de multas não definida", "Informe a conta em Configurações › Impostos")
+            if c.juros:
+                linhas_c.append(("JUROS", self.contas_tributo.get("JUROS", ""), c.juros,
+                                 self._modelo("juros_tributo", tributo=tribs, pa=pa, doc=doc)))
+                if not self.contas_tributo.get("JUROS"):
+                    piora("pendente", "Conta de juros não definida", "Informe a conta em Configurações › Impostos")
+            if self.perfil.cnpj and c.cnpj and re.sub(r"\D", "", self.perfil.cnpj)[:8] != c.cnpj[:8]:
+                piora("pendente", "CNPJ do comprovante é de outra empresa", f"CNPJ {c.cnpj} {c.razao_social}")
+            for a in c.avisos:
+                piora("revisar", "Comprovante com leitura incompleta", a)
+            for trib, conta, valor, hist in linhas_c:
+                st_l = "ok" if conta else "pendente"
+                out.append(self._base(mov, valor=round(valor, 2), conta_contra=conta, historico=hist, nf=doc,
+                                      status=st_l, origem=f"Comprovante e-CAC ({c.tipo})", confianca=95 if conta else 0,
+                                      parte=trib, motivo="" if conta else "Conta não definida"))
+        if mov.id in self._sem_extrato:
+            piora("revisar", self._sem_extrato[mov.id], "Comprovante sem débito correspondente no extrato")
+        conf_banco = min((getattr(c, "_conf_banco", 100) for c in comps), default=100)
+        if not mov.conta_banco:
+            piora("pendente", "Banco do comprovante sem conta",
+                  f"Informe em Configurações › Impostos a conta do banco {comps[0].banco} ag. {comps[0].agencia}")
+        elif conf_banco < 90 and mov.id in self._sem_extrato:
+            piora("revisar", "Confirme o banco do comprovante", f"Banco {comps[0].banco_nome} → {self.nome_conta(mov.conta_banco)}")
+        if len(comps) > 1:
+            piora("ok", "", f"{len(comps)} comprovantes pagos no mesmo débito")
+        if out:
+            status, motivo, obs = alerta
+            if sev.get(out[0].status, 2) > sev[status]:
+                out[0].status = status
+            out[0].motivo = motivo or out[0].motivo
+            principal_obs = obs or (todos_obs[0] if todos_obs else "")
+            outros = [o for o in todos_obs if o != principal_obs and not o.startswith(motivo + ": " + obs)]
+            out[0].observacao = " | ".join(x for x in [principal_obs] + outros + [
+                f"{c.tipo} {c.numero} (banco {c.banco or '?'} ag. {c.agencia or '?'}): principal {br(c.principal)}, multa {br(c.multa)}, juros {br(c.juros)}"
+                for c in comps] if x)
+            out[0].confianca = 95 if status == "ok" else (70 if status == "revisar" else 30)
+        return out
+
+    def _provisao(self, conta: str, pa) -> float | None:
+        """Créditos lançados na conta do tributo no mês do período de apuração (None se o razão não cobre o mês)."""
+        if pa is None:
+            return None
+        mes = (pa.year, pa.month)
+        if not any((m.data.year, m.data.month) == mes for m in self.razao.movimentos):
+            return None
+        return round(sum(m.credito for m in self.razao.movimentos if m.conta == conta and (m.data.year, m.data.month) == mes), 2)
 
     def _forcado(self, mov: Movimento, f: dict) -> list[Lancamento]:
         """Aplica a decisão do operador (conta escolhida, notas escolhidas ou ignorar)."""
@@ -243,6 +407,10 @@ class Classificador:
                 return [self._base(mov, conta_contra=m.contrapartida, historico=m.historico, status="ja_lancado", motivo="Já consta no razão",
                                    origem="Já consta no razão", confianca=100,
                                    observacao=f"Lote {m.lote} lanç. {m.lancamento}".strip())]
+
+        # 1b) comprovante de pagamento do e-CAC
+        if mov.id in self._comp_por_mov:
+            return self._lancar_comprovantes(mov, self._comp_por_mov[mov.id])
 
         # 2) memória
         mem = self.perfil.memoria.get(chave_memoria(mov.descricao))
@@ -548,7 +716,7 @@ def formatar(modelo: str, **kw) -> str:
     if not modelo:
         return ""
     vals = {k: (v or "") for k, v in kw.items()}
-    for k in ("nf", "parte", "descricao", "banco", "mes", "imposto"):
+    for k in ("nf", "parte", "descricao", "banco", "mes", "imposto", "tributo", "pa", "doc"):
         vals.setdefault(k, "")
     try:
         txt = modelo.format(**vals)

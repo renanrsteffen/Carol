@@ -1,5 +1,9 @@
 # Plano — Lançamentos a partir dos comprovantes de pagamento do e-CAC
 
+> **Situação (22/11/2026):** etapas 1 a 6 implementadas e testadas com PDFs de exemplo. Falta validar o leitor com PDFs reais do e-CAC.
+>
+> **Decisões do escritório:** DAS tudo na conta do Simples · impostos normais já vão à despesa na apuração, então o pagamento baixa só o passivo · taxas e impostos esporádicos direto na despesa · multa e juros em contas próprias · comprovante sem extrato é lançado e marcado para conferir.
+
 ## Objetivo
 
 Ler os comprovantes de pagamento baixados do e-CAC (DARF, DAS, DARF da DCTFWeb e GPS) e gerar os lançamentos de pagamento de impostos:

@@ -3,6 +3,7 @@ dados/
 clientes/
 exemplos/*.xlsx
 exemplos/*.ofx
+exemplos/*.pdf
 __pycache__/
 .pytest_cache/
 .venv/

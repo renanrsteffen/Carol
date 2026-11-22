@@ -121,7 +121,8 @@ def test_saida_siger(resultado):
     assert all(isinstance(l[5], str) and len(l[5]) == 10 for l in linhas)
     # a soma do banco confere com o extrato (exceto o que já está no razão)
     total = sum(l[8] if l[4] == "D" else -l[8] for l in linhas)
-    extrato = sum(m.valor for m in resultado.movimentos) - (-12.0) - (-350.0)
+    exportados = {l.mov_id for l in lancs if l.status != "ja_lancado"}
+    extrato = sum(m.valor for m in resultado.movimentos if m.id in exportados)
     assert round(total, 2) == round(extrato, 2)
     gerar_conferencia(resultado.lancamentos, resultado.titulos, {}, resultado.totais_extrato)
 

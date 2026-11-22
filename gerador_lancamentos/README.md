@@ -35,6 +35,7 @@ Tudo fica na pasta **`dados/`**, dentro da pasta do programa:
 | **Cliente** (barra lateral) | Crie ou escolha o cliente. Informe o número e a descrição do lote. |
 | **1 · Arquivos** | Envie o **razão** (Excel/CSV), os **extratos** (OFX, Excel, CSV ou PDF) e, se tiver, o **relatório financeiro**. Escolha a conta contábil de cada extrato (fica gravada para os próximos meses). Clique em **Gerar lançamentos**. |
 | **2 · Lançamentos** | Fila de revisão. Uma linha por movimento do extrato; o que pede atenção vem primeiro, com o motivo em poucas palavras (🔴 precisa de decisão · 🟡 conferir · 🟢 pronto · 📗 já no razão · ⚪ ignorado). Clique na linha: o painel mostra o porquê, o lançamento proposto e as **outras possibilidades encontradas**; escolha, ajuste histórico/NF se quiser e **Confirmar** — a fila segue para o próximo. **Desfazer** volta à sugestão do programa. |
+| **Comprovantes e-CAC** (opcional, na aba 1) | PDFs de DARF, DAS, DCTFWeb e GPS. Cada comprovante vira lançamentos por tributo, com multa e juros separados — veja abaixo. |
 | **3 · Notas em aberto** | Notas de clientes/fornecedores em aberto no razão e o saldo que fica depois dos extratos. |
 | **4 · Exportar** | Conferência extrato × lançamentos por banco, validação e download do **arquivo SIGER** e da **planilha de conferência**. |
 | **⚙️ Configurações** | Contas de juros/descontos, regras, modelos de histórico, tipo das contas e memória do cliente. |
@@ -74,6 +75,28 @@ Para cada recebimento/pagamento o programa testa, nesta ordem, e escolhe a hipó
 
 Notas emitidas depois da data do pagamento não são consideradas. Hipóteses menos seguras (parcela, juros, parcial, busca sem nome) ficam como **Conferir** (🟡). Quando duas contas são igualmente prováveis, o programa não escolhe: deixa 🔴 e mostra as opções para o operador decidir. As decisões do operador são reaplicadas sempre que a classificação é refeita, e as notas escolhidas não são usadas de novo em outro movimento.
 
+### Comprovantes de pagamento do e-CAC
+
+Envie os PDFs baixados do e-CAC (um ou vários comprovantes por arquivo). Para cada comprovante:
+
+| Situação | Lançamento |
+|---|---|
+| **DAS** | total do principal na conta do **Simples Nacional** |
+| **Impostos normais** (PIS, COFINS, IRPJ, CSLL, IRRF, PIS/COFINS/CSLL retidos, INSS, IPI, parcelamentos) | débito no **passivo "a recolher"** (a despesa já foi lançada na apuração), uma linha por tributo |
+| **Taxas e impostos esporádicos** (códigos não reconhecidos como impostos normais) | direto na **despesa** (conta de taxas e impostos), marcado para conferir |
+| **Multa e juros** | contas próprias, separados do principal |
+
+- A **conta do banco** vem do banco/agência do comprovante. Se o cliente não tem conta daquele banco, o programa pede a conta uma vez e grava.
+- O débito genérico do extrato ("PAGAMENTO DARF") é **substituído** pelo detalhe do comprovante. Vários DARFs pagos num único débito são casados pela soma.
+- **Comprovante sem débito no extrato**: lançado mesmo assim, marcado 🟡 "Sem extrato para conferir" (ou "Não encontrado no extrato", se o extrato daquele banco foi enviado).
+- **Conferência com a provisão**: o principal pago é comparado com o crédito lançado na conta "a recolher" no mês do período de apuração; diferença → 🟡.
+- **CNPJ** de outra empresa → 🔴 bloqueado (informe o CNPJ do cliente em Configurações).
+- As contas dos tributos, de multa, de juros e de taxas são procuradas no plano de contas pelo nome ("COFINS A RECOLHER", "MULTAS FISCAIS"…). Confira e ajuste em **Configurações › Impostos**. Envie o **plano de contas** para que contas sem movimento no razão também sejam encontradas.
+- Histórico: `VLR. PAGO REF. COFINS PA 10/2026 - DOC 07.18.…`, `VLR. MULTA S/ PAGTO IRPJ PA 09/2026`; o nº do documento vai na coluna "Número do documento" do SIGER.
+- A planilha de conferência ganha a aba **Impostos pagos** com a composição de cada comprovante e a conta usada.
+
+> O leitor foi feito pelo layout conhecido do comprovante do e-CAC e testado com PDFs de exemplo. Deve ser validado com PDFs reais.
+
 ### Históricos
 
 Formais e em maiúsculas, com o número da nota quando houver. Padrões (editáveis em Configurações):
@@ -108,6 +131,8 @@ core/classificador.py   motor de classificação
 core/busca.py           busca do pagamento nas notas em aberto (parcela, retenção, soma, juros...)
 core/armazenamento.py   pasta dados/, gravação segura, trabalhos salvos e backups
 core/estado.py          salvar/abrir o trabalho do mês
+core/ecac.py            leitura dos comprovantes de arrecadação do e-CAC
+core/tributos.py        identificação do tributo e das contas (passivo, despesa, multa, juros, banco)
 core/perfil.py          perfil do cliente, regras padrão, modelos de histórico, memória
 core/exportar.py        arquivo SIGER e planilha de conferência
 exemplos/               gerador de dados fictícios para teste

@@ -24,6 +24,10 @@ MODELOS_PADRAO = {
     "desconto_obtido": "VLR. DESCONTO OBTIDO S/ NF {nf} - {parte}",
     "desconto_concedido": "VLR. DESCONTO CONCEDIDO S/ NF {nf} - {parte}",
     "retencao": "VLR. {imposto} RETIDO S/ NF {nf} - {parte}",
+    "imposto_pago": "VLR. PAGO REF. {tributo} PA {pa} - DOC {doc}",
+    "imposto_esporadico": "VLR. PAGO REF. {tributo} - DOC {doc}",
+    "multa_tributo": "VLR. MULTA S/ PAGTO {tributo} PA {pa}",
+    "juros_tributo": "VLR. JUROS S/ PAGTO {tributo} PA {pa}",
     "generico_saida": "VLR. PAGO REF. {descricao}",
     "generico_entrada": "VLR. RECEBIDO REF. {descricao}",
 }
@@ -96,6 +100,8 @@ class Perfil:
     conta_desconto_concedido: str = ""
     tolerancia_juros_pct: float = 10.0                       # diferença máxima (%) tratada como juros/desconto
     contas_retencao: dict = field(default_factory=dict)      # IRRF/PIS/COFINS/CSLL/ISS/INSS -> {cliente, fornecedor}
+    contas_tributo: dict = field(default_factory=dict)       # SIMPLES/PIS/COFINS/.../MULTA/JUROS/OUTROS -> conta
+    bancos_comprovante: dict = field(default_factory=dict)   # "001|1234" ou "001" -> conta do banco
     tipos_conta: dict = field(default_factory=dict)          # código -> cliente | fornecedor | banco | outra
     modelos: dict = field(default_factory=lambda: dict(MODELOS_PADRAO))
     regras: list = field(default_factory=lambda: [asdict(r) for r in REGRAS_PADRAO])

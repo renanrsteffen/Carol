@@ -81,7 +81,8 @@ def _cod(c):
     return int(c) if c.isdigit() else c
 
 
-def gerar_conferencia(lancs: list[Lancamento], titulos: list[Titulo], nomes: dict[str, str], totais_extrato: dict) -> bytes:
+def gerar_conferencia(lancs: list[Lancamento], titulos: list[Titulo], nomes: dict[str, str], totais_extrato: dict,
+                      ids_extrato: set | None = None, comprovantes: list | None = None) -> bytes:
     wb = Workbook()
     ws = wb.active
     ws.title = "Resumo"
@@ -91,6 +92,8 @@ def gerar_conferencia(lancs: list[Lancamento], titulos: list[Titulo], nomes: dic
     for l in lancs:
         if l.observacao.startswith("Lançamento sem movimento bancário"):
             continue
+        if ids_extrato is not None and l.mov_id not in ids_extrato:
+            continue  # comprovante sem linha no extrato
         b = por_banco[l.conta_banco]
         if l.status == "ja_lancado":
             b[2] += l.valor
@@ -100,6 +103,7 @@ def gerar_conferencia(lancs: list[Lancamento], titulos: list[Titulo], nomes: dic
         te, ts = totais_extrato.get(banco, (0.0, 0.0))
         ws.append([f"{banco} - {nomes.get(banco, '')}", round(te, 2), round(ts, 2), round(ent, 2), round(sai, 2),
                    round(ja, 2), round(te - ts - (ent - sai) - _ja_liq(lancs, banco), 2)])
+
     for row in ws.iter_rows(min_row=2):
         for c in row[1:]:
             c.number_format = "#,##0.00"
@@ -130,13 +134,32 @@ def gerar_conferencia(lancs: list[Lancamento], titulos: list[Titulo], nomes: dic
     _larguras(ws3, [11, 10, 40, 12, 11, 14, 16])
     ws3.auto_filter.ref = ws3.dimensions
 
+    if comprovantes:
+        ws4 = wb.create_sheet("Impostos pagos")
+        _cabecalho(ws4, ["Tipo", "Nº documento", "PA", "Vencimento", "Arrecadação", "Banco", "Agência", "Código",
+                         "Denominação", "Principal", "Multa", "Juros", "Total", "Lançado em"])
+        conta_por_doc = {}
+        for l in lancs:
+            if "e-CAC" in l.origem:
+                conta_por_doc.setdefault(l.nf, []).append(f"{l.conta_contra} {nomes.get(str(l.conta_contra), '')}".strip())
+        for c in comprovantes:
+            for it in c.itens:
+                ws4.append([c.tipo, c.numero, c.pa_texto, fmt_data(c.vencimento), fmt_data(c.data_arrecadacao),
+                            c.banco_nome or c.banco, c.agencia, it.codigo, it.denominacao, it.principal, it.multa,
+                            it.juros, it.total, " / ".join(dict.fromkeys(conta_por_doc.get(c.numero, [])))])
+                for col in (10, 11, 12, 13):
+                    ws4.cell(ws4.max_row, col).number_format = "#,##0.00"
+        _larguras(ws4, [9, 24, 9, 11, 11, 18, 8, 8, 40, 12, 10, 10, 12, 50])
+        ws4.auto_filter.ref = ws4.dimensions
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
 def _ja_liq(lancs, banco):
-    return sum((l.valor if l.natureza == "entrada" else -l.valor) for l in lancs if l.status == "ja_lancado" and l.conta_banco == banco)
+    return sum((l.valor if l.natureza == "entrada" else -l.valor) for l in lancs
+               if l.status == "ja_lancado" and l.conta_banco == banco and not l.mov_id.startswith("ecac-"))
 
 
 def _larguras(ws, larg):

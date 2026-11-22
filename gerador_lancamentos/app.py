@@ -14,7 +14,9 @@ import streamlit as st
 
 from core import armazenamento as arm
 from core.classificador import Classificador, Contexto
+from core.ecac import Comprovante, ler_comprovantes
 from core.estado import competencia, desempacotar, empacotar
+from core.tributos import NOMES as NOMES_TRIBUTO
 from core.exportar import ROTULO_STATUS, gerar_conferencia, gerar_siger, validar
 from core.extratos import ler_extrato
 from core.financeiro import ler_financeiro
@@ -42,6 +44,8 @@ def init():
     SS.setdefault("versao", 0)
     SS.setdefault("editados", set())
     SS.setdefault("forcados", {})
+    SS.setdefault("comprovantes", [])
+    SS.setdefault("comp_por_mov", {})
     SS.setdefault("sel_mov", None)
     SS.setdefault("salvo_em", None)
     if "backup_feito" not in SS:
@@ -62,7 +66,8 @@ def salvar_trabalho_atual():
     try:
         arm.salvar_trabalho(SS.perfil.nome, competencia(SS.lancs), empacotar(
             lancs=SS.lancs, movs=SS.movs, titulos_inicio=SS.titulos_inicio, titulos=SS.titulos, razao=SS.razao,
-            totais=SS.totais, financeiro=SS.get("financeiro_itens", []), forcados=SS.forcados))
+            totais=SS.totais, financeiro=SS.get("financeiro_itens", []), forcados=SS.forcados,
+            comprovantes=SS.comprovantes))
         SS.salvo_em = datetime.now()
     except OSError as e:
         st.error(f"Erro ao salvar o trabalho: {e}")
@@ -177,15 +182,18 @@ def reclassificar():
     itens = [copy.copy(i) for i in SS.get("financeiro_itens", [])]
     for i in itens:
         i.usado = False
-    clf = Classificador(Contexto(perfil=perfil, razao=SS.razao, titulos=titulos, financeiro=itens, forcados=SS.forcados))
+    clf = Classificador(Contexto(perfil=perfil, razao=SS.razao, titulos=titulos, financeiro=itens, forcados=SS.forcados,
+                                 comprovantes=SS.comprovantes))
     novos = clf.classificar(SS.movs)
+    SS.comp_por_mov = {k: [(c.banco, c.agencia) for c in v] for k, v in clf._comp_por_mov.items()}
+    SS.contas_tributo_sugeridas = clf.contas_tributo_sugeridas
     novos.sort(key=lambda l: (l.data, l.conta_banco, l.mov_id))
     SS.update(lancs=novos, titulos=clf.titulos, contas_regra=clf.contas_regra)
     SS.versao += 1
     salvar_trabalho_atual()
 
 
-def processar(razoes, plano, extratos_cfg, financeiros):
+def processar(razoes, plano, extratos_cfg, financeiros, comprovantes=None):
     razao = Razao.carregar(razoes) if razoes else Razao()
     if plano:
         razao.aplicar_plano(ler_plano(plano))
@@ -205,7 +213,8 @@ def processar(razoes, plano, extratos_cfg, financeiros):
         s = -sum(m.valor for m in movs_arq if m.valor < 0)
         te, ts = totais.get(conta, (0.0, 0.0))
         totais[conta] = (te + e, ts + s)
-    ids = {m.id for m in movs}
+    SS.comprovantes = list(comprovantes or [])
+    ids = {m.id for m in movs} | {c.id for c in SS.comprovantes}
     SS.forcados = {k: v for k, v in SS.forcados.items() if k in ids}  # decisões anteriores dos mesmos movimentos
     SS.update(titulos_inicio=titulos, razao=razao, movs=movs, totais=totais, financeiro_itens=itens, sel_mov=None)
     reclassificar()
@@ -224,6 +233,9 @@ with aba_arq:
         st.subheader("Extratos bancários")
         extratos = st.file_uploader("Extratos (OFX, Excel, CSV ou PDF)", type=["ofx", "qfx", "xlsx", "xls", "csv", "pdf"],
                                     accept_multiple_files=True, key="up_ext")
+        arqs_ecac = st.file_uploader("Comprovantes de pagamento do e-CAC (PDF, opcional)", type=["pdf"],
+                                     accept_multiple_files=True, key="up_ecac",
+                                     help="DARF, DAS, DCTFWeb e GPS. Pode ser um PDF com vários comprovantes.")
 
     razao_prev = None
     if razoes:
@@ -279,12 +291,38 @@ with aba_arq:
             if not movs_arq:
                 st.warning(f"{arq.name}: nenhum movimento encontrado. Se for PDF escaneado, prefira OFX ou Excel.")
 
-    pronto = bool(extratos_cfg) and len(extratos_cfg) == len(extratos or [])
+    comprovantes_lidos: list[Comprovante] = []
+    if arqs_ecac:
+        st.subheader("Comprovantes do e-CAC")
+        for arq in arqs_ecac:
+            try:
+                comprovantes_lidos.extend(ler_comprovantes(arq))
+            except Exception as e:  # noqa: BLE001
+                st.error(f"{arq.name}: erro na leitura ({e})")
+        if comprovantes_lidos:
+            por_banco: dict[str, list] = {}
+            for c in comprovantes_lidos:
+                por_banco.setdefault(f"{c.banco_nome or 'banco não informado'} ag. {c.agencia or '?'}", []).append(c)
+            st.markdown(f"**{len(comprovantes_lidos)} comprovantes** · total R$ {fmt_valor(sum(c.total for c in comprovantes_lidos))}  \n"
+                        + " · ".join(f"{b}: {len(cs)} (R$ {fmt_valor(sum(c.total for c in cs))})" for b, cs in por_banco.items()))
+            cnpjs = {c.cnpj[:8] for c in comprovantes_lidos if c.cnpj}
+            meu = "".join(ch for ch in perfil.cnpj if ch.isdigit())[:8]
+            if meu and cnpjs - {meu}:
+                st.error("Há comprovantes de outro CNPJ — eles ficarão bloqueados na revisão.")
+            elif not meu and len(cnpjs) == 1:
+                st.caption("Dica: informe o CNPJ do cliente em Configurações para o programa bloquear comprovantes de outra empresa.")
+            com_aviso = [c for c in comprovantes_lidos if c.avisos]
+            if com_aviso:
+                st.warning(f"{len(com_aviso)} comprovante(s) com leitura incompleta — aparecerão para conferir.")
+        else:
+            st.warning("Nenhum comprovante encontrado nos PDFs. Se for PDF escaneado (imagem), baixe de novo direto do e-CAC.")
+
+    pronto = (bool(extratos_cfg) or bool(comprovantes_lidos)) and len(extratos_cfg) == len(extratos or [])
     if extratos and not pronto:
         st.info("Escolha a conta contábil de todos os extratos para continuar.")
     if st.button("▶️ Gerar lançamentos", type="primary", disabled=not pronto, width="stretch"):
         with st.spinner("Lendo, cruzando notas e classificando..."):
-            processar(razoes, plano, extratos_cfg, financeiros)
+            processar(razoes, plano, extratos_cfg, financeiros, comprovantes_lidos)
             perfil.salvar()
         st.success(f"{len(SS.lancs)} lançamentos gerados e trabalho salvo no computador. Vá para a aba **2 · Lançamentos**.")
 
@@ -337,6 +375,38 @@ def decidir(mov_id: str, decisao: dict | None, memorizar: bool = False):
     SS.sel_mov = None   # a fila segue para o próximo
 
 
+def ajuste_comprovante(g: list[Lancamento]):
+    """Conta do banco ou do tributo que faltou: grava no cliente e refaz a classificação."""
+    p = g[0]
+    ops = opcoes_contas()
+    with st.container(border=True):
+        st.markdown("**Completar o cadastro** — vale para os próximos comprovantes deste cliente")
+        mudancas = {}
+        bancos = SS.comp_por_mov.get(p.mov_id, [])
+        if bancos and (not p.conta_banco or "banco" in p.motivo.lower()):
+            b, ag = bancos[0]
+            atual = rotulo(p.conta_banco) if p.conta_banco else None
+            esc = st.selectbox(f"Conta do banco {b} ag. {ag}", ops, index=ops.index(atual) if atual in ops else None,
+                               placeholder="Escolha a conta do banco…", key=f"cb_{p.mov_id}_{SS.versao}")
+            if esc and cod_de(esc) != p.conta_banco:
+                mudancas[("banco", f"{b}|{ag}")] = cod_de(esc)
+        for l in g:
+            if not l.conta_contra and l.parte:
+                esc = st.selectbox(f"Conta de {NOMES_TRIBUTO.get(l.parte, l.parte).lower()}", ops, index=None,
+                                   placeholder="Escolha a conta…", key=f"ct_{l.parte}_{p.mov_id}_{SS.versao}")
+                if esc:
+                    mudancas[("tributo", l.parte)] = cod_de(esc)
+        if st.button("Salvar e aplicar", key=f"aj_{p.mov_id}", disabled=not mudancas):
+            for (tipo, chave), conta in mudancas.items():
+                if tipo == "banco":
+                    perfil.bancos_comprovante[chave] = conta
+                else:
+                    perfil.contas_tributo[chave] = conta
+            perfil.salvar()
+            reclassificar()
+            st.rerun()
+
+
 def painel(g: list[Lancamento]):
     p = g[0]
     st_g = status_grupo(g)
@@ -346,7 +416,10 @@ def painel(g: list[Lancamento]):
         cor = "red" if p.natureza == "saida" else "green"
         st.markdown(f"##### {ICONE[st_g]} :{cor}[{valor_sinal(p) if len(g) == 1 else ('+ ' if p.natureza == 'entrada' else '− ') + fmt_valor(sum(l.valor for l in g if l.conta_banco == p.conta_banco))}]"
                     f" &nbsp;·&nbsp; {fmt_data(p.data)}")
-        st.caption(f"Extrato ({rotulo(p.conta_banco)}): **{p.descricao_extrato}**")
+        if p.mov_id.startswith("ecac-"):
+            st.caption(f"Comprovante do e-CAC sem linha no extrato · banco: {rotulo(p.conta_banco) or 'não definido'}  \n**{p.descricao_extrato}**")
+        else:
+            st.caption(f"Extrato ({rotulo(p.conta_banco)}): **{p.descricao_extrato}**")
 
         # por que precisa de atenção
         expl = p.observacao.split(" | ")[0] if p.observacao else ""
@@ -376,6 +449,9 @@ def painel(g: list[Lancamento]):
                     linha = f"{'D' if l.natureza == 'entrada' else 'C'} {nome_curto(l.conta_banco, 26)} · {'C' if l.natureza == 'entrada' else 'D'} **{nome_curto(l.conta_contra, 40)}** _(sem banco)_"
                 st.markdown(f"{linha} &nbsp; `{fmt_valor(l.valor)}`  \n<span style='color:#6b7280;font-size:0.85em'>{l.historico or '—'}</span>",
                             unsafe_allow_html=True)
+
+        if any("e-CAC" in l.origem for l in g) and st_g in ("pendente", "revisar"):
+            ajuste_comprovante(g)
 
         if st_g == "ja_lancado":
             if st.button("Não está no razão — lançar mesmo assim", key=f"nl_{mov_id}"):
@@ -544,7 +620,8 @@ with aba_exp:
         st.subheader("Conferência por banco")
         linhas = []
         for banco, (te, ts) in SS.totais.items():
-            ls = [l for l in lancs if l.conta_banco == banco and l.status != "ignorar"]
+            ids_extrato = {m.id for m in SS.movs}
+            ls = [l for l in lancs if l.conta_banco == banco and l.status != "ignorar" and l.mov_id in ids_extrato]
             ent = sum(l.valor for l in ls if l.natureza == "entrada")
             sai = sum(l.valor for l in ls if l.natureza == "saida")
             ign = sum((l.valor if l.natureza == "entrada" else -l.valor) for l in lancs if l.conta_banco == banco and l.status == "ignorar")
@@ -579,7 +656,8 @@ with aba_exp:
         nome_siger = f"Importacao_SIGER_{nome_cli}_{periodo}.xlsx"
         nome_conf = f"Conferencia_{nome_cli}_{periodo}.xlsx"
         dados_siger = gerar_siger(para_exportar, perfil.lote, perfil.descricao_lote) if pode else b""
-        dados_conf = gerar_conferencia(lancs, SS.titulos, nomes, SS.totais)
+        dados_conf = gerar_conferencia(lancs, SS.titulos, nomes, SS.totais, ids_extrato={m.id for m in SS.movs},
+                                       comprovantes=SS.comprovantes)
         c1.download_button("⬇️ Baixar importação SIGER (.xlsx)", data=dados_siger, file_name=nome_siger,
                            disabled=not pode, type="primary", width="stretch",
                            on_click=arm.guardar_exportado, args=(perfil.nome, nome_siger, dados_siger))
@@ -590,6 +668,8 @@ with aba_exp:
 
 # ------------------------------------------------------------------------------------ configurações
 with aba_cfg:
+    perfil.cnpj = st.text_input("CNPJ do cliente", perfil.cnpj, placeholder="00.000.000/0000-00",
+                                help="Usado para bloquear comprovantes do e-CAC de outra empresa.")
     st.subheader("Contas para juros e descontos")
     st.caption("Quando o valor pago/recebido for diferente do saldo da nota (até a tolerância), o programa separa a diferença nestas contas.")
     ops = opcoes_contas()
@@ -620,6 +700,38 @@ with aba_cfg:
         perfil.contas_retencao[imp] = cfg
     perfil.tolerancia_juros_pct = st.slider("Tolerância de diferença tratada como juros/desconto (%)", 0.0, 30.0,
                                             float(perfil.tolerancia_juros_pct), 0.5)
+
+    st.subheader("Impostos (comprovantes do e-CAC)")
+    st.caption("DAS: tudo na conta do Simples. Impostos normais: o pagamento baixa o passivo \"a recolher\" "
+               "(a despesa já foi lançada na apuração). Taxas e impostos esporádicos: direto na despesa. "
+               "Multa e juros: contas próprias. Conta vazia = o programa procura no plano/razão.")
+    sug = SS.get("contas_tributo_sugeridas", {})
+    if not sug and SS.razao:
+        from core.tributos import sugerir_contas
+        sug = sugerir_contas(SS.razao.contas)
+    itens_trib = [("SIMPLES", "Simples Nacional (DAS)"), ("PIS", "PIS a recolher"), ("COFINS", "COFINS a recolher"),
+                  ("IRPJ", "IRPJ a recolher"), ("CSLL", "CSLL a recolher"), ("IRRF", "IRRF a recolher"),
+                  ("CSRF", "PIS/COFINS/CSLL retidos a recolher"), ("INSS", "INSS a recolher"), ("IPI", "IPI a recolher"),
+                  ("PARCELAMENTO", "Parcelamentos"), ("MULTA", "Multas sobre tributos"), ("JUROS", "Juros sobre tributos"),
+                  ("OUTROS", "Taxas e impostos esporádicos (despesa)")]
+    tc = st.columns(3)
+    for i, (k, rot_t) in enumerate(itens_trib):
+        with tc[i % 3]:
+            atual = perfil.contas_tributo.get(k, "")
+            escolhido = sel_conta(rot_t + (f"  ·  sugerida: {sug[k]}" if sug.get(k) and not atual else ""), atual, f"trib_{k}")
+            if escolhido:
+                perfil.contas_tributo[k] = escolhido
+            else:
+                perfil.contas_tributo.pop(k, None)
+    if perfil.bancos_comprovante:
+        st.markdown("**Bancos dos comprovantes**")
+        for chave in list(perfil.bancos_comprovante):
+            b, _, ag = chave.partition("|")
+            novo_b = sel_conta(f"Banco {b} ag. {ag or 'qualquer'}", perfil.bancos_comprovante[chave], f"bc_{chave}")
+            if novo_b:
+                perfil.bancos_comprovante[chave] = novo_b
+            else:
+                perfil.bancos_comprovante.pop(chave)
 
     st.subheader("Regras de classificação")
     st.caption("Padrão = palavras do extrato (expressão regular, em maiúsculas sem acento; use | para ‘ou’). "
