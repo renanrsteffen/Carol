@@ -6,7 +6,7 @@ Transforma **extratos bancários** (e, se houver, o **relatório financeiro** do
 
 1. Instale o Python 3.12 (3.11 ou superior) (https://www.python.org — no Windows marque **"Add Python to PATH"**).
 2. Copie a pasta `gerador_lancamentos` para o computador.
-3. Dê dois cliques em **`iniciar.bat`** (Windows) ou rode `./iniciar.sh` (Mac/Linux).
+3. Dê dois cliques em **`iniciar.bat`** (Windows) ou rode `./iniciar.sh` (Mac/Linux). A pasta pode ficar no computador ou na rede (`\\servidor\...`); as bibliotecas são instaladas em cada computador e os dados ficam na pasta do programa.
    Na primeira vez ele instala o que precisa (alguns minutos); depois abre direto no navegador.
 
 O programa roda no próprio computador: nenhum arquivo do cliente é enviado para a internet, e depois de instalado funciona sem internet. As versões das bibliotecas estão fixadas em `requirements.txt`, então atualizações externas não quebram o programa.
