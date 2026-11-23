@@ -40,7 +40,7 @@ Tudo fica na pasta **`dados/`**, dentro da pasta do programa:
 | **Comprovantes e-CAC** (opcional, na aba 1) | PDFs de DARF, DAS, DCTFWeb e GPS. Cada comprovante vira lançamentos por tributo, com multa e juros separados — veja abaixo. |
 | **3 · Notas em aberto** | Notas de clientes/fornecedores em aberto no razão e o saldo que fica depois dos extratos. |
 | **4 · Exportar** | Conferência extrato × lançamentos por banco, validação e download do **arquivo SIGER** e da **planilha de conferência**. |
-| **⚙️ Configurações** | Contas de juros/descontos, regras, modelos de histórico, tipo das contas e memória do cliente. |
+| **⚙️ Configurações** | **📌 Regras do cliente** (no topo): "quando o texto tiver X → lançar em tal conta, com tal histórico". Ex.: `EMPRESA Y` → Caixa; `COMISSAO, COMISSOES` → Caixa (saque); `LEANDRO + CHINA` → 155. `+` = todas as palavras; vírgula = qualquer uma. Valem antes de tudo e leem o extrato e o relatório do cliente. **📝 Lembretes** livres. Os dois aparecem no topo da revisão. Mais abaixo: contas de juros/descontos/impostos, de-para, códigos de DARF, modelos de histórico, tipo das contas e regras gerais (avançado). |
 
 **Dica:** envie o razão com **alguns meses anteriores** (ou desde o início do ano). Quanto mais histórico, melhor ele conhece as notas em aberto e as contas que você usa.
 

@@ -3,7 +3,7 @@ from datetime import date
 from core.busca import buscar, melhor_entre_contas
 from core.classificador import Classificador, Contexto
 from core.modelos import Conta, Movimento, Titulo
-from core.perfil import Perfil
+from core.perfil import Perfil, Regra
 from core.razao import Razao
 
 D = date(2026, 11, 10)
@@ -155,3 +155,22 @@ def test_decisao_conta_comum_e_ignorar():
     a = next(l for l in ls if l.mov_id == "a"); b = next(l for l in ls if l.mov_id == "b")
     assert a.conta_contra == "700" and a.status == "ok" and a.historico == "VLR. REF. OUTRAS RECEITAS"
     assert b.status == "ignorar"
+
+
+def test_regra_do_cliente_em_linguagem_simples():
+    from dataclasses import asdict
+    regras = [Regra("c1", "EMPRESA Y", "saida", "1", "VLR SAQUE BCO", True, True, True),
+              Regra("c2", "COMISSAO, COMISSOES", "saida", "1", "VLR SAQUE BCO", True, True, True),
+              Regra("c3", "LEANDRO + CHINA", "saida", "155", "VLR REF. LEANDRO", True, True, True)]
+    assert regras[0].casa("PIX ENVIADO EMPRESA Y LTDA", False) and not regras[0].casa("PIX RECEBIDO EMPRESA Y", True)
+    assert regras[1].casa("PAGO COMISSOES VENDEDORES", False) and regras[1].casa("COMISSAO JOAO", False)
+    assert regras[2].casa("RET LUCRO LEANDRO FOR CHINA", False) and not regras[2].casa("RET LUCRO LEANDRO", False)
+    r = Razao()
+    r.contas = {"5": Conta("5", "BANCO X", tipo="banco"), "1": Conta("1", "CAIXA"),
+                "900": Conta("900", "EMPRESA Y LTDA", tipo="fornecedor")}
+    p = Perfil(nome="t")
+    p.regras = [asdict(x) for x in regras] + p.regras
+    clf = Classificador(Contexto(perfil=p, razao=r))
+    l = clf.classificar([Movimento("m", D, "PIX ENVIADO - EMPRESA Y LTDA", -350.0, conta_banco="5")])[0]
+    # a regra do cliente vence a conta de fornecedor com o mesmo nome
+    assert (l.conta_contra, l.historico, l.status) == ("1", "VLR SAQUE BCO", "ok")

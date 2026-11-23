@@ -568,6 +568,16 @@ def painel(g: list[Lancamento]):
 
 
 with aba_lanc:
+    regras_ativas = [r for r in perfil.regras if r.get("simples") and r.get("ativa", True)]
+    if perfil.lembretes.strip() or regras_ativas:
+        with st.expander(f"📝 Lembretes deste cliente ({len(regras_ativas)} regra(s))", expanded=True):
+            if perfil.lembretes.strip():
+                st.markdown(perfil.lembretes)
+            if regras_ativas:
+                tipo = {"saida": "pagamento", "entrada": "recebimento", "ambos": "entrada/saída"}
+                st.markdown("\n".join(f"- **{r['padrao']}** ({tipo.get(r.get('natureza'), '')}) → {rotulo(r['conta'])}"
+                                       + (f" · _{r['historico']}_" if r.get("historico") else "") for r in regras_ativas))
+            st.caption("Edite em ⚙️ Configurações › Regras do cliente.")
     lancs: list[Lancamento] = SS.lancs
     if not lancs:
         st.info("Gere os lançamentos na aba **1 · Arquivos**.")
@@ -731,7 +741,59 @@ with aba_exp:
 
 
 # ------------------------------------------------------------------------------------ configurações
+def regras_do_editor(ed_rc) -> list[dict]:
+    out = []
+    for _, r in ed_rc.iterrows():
+        texto = str(r.get("Quando o texto tiver") or "").strip()
+        conta = cod_de(r.get("Lançar em"))
+        if not texto or not conta:
+            continue
+        ativa = r.get("Ativa", True)
+        out.append(asdict(Regra(nome=f"Regra do cliente: {texto[:40]}", padrao=texto,
+                                natureza=NATUREZAS.get(r.get("Tipo"), "ambos"), conta=conta,
+                                historico=str(r.get("Histórico") or "").upper(),
+                                ativa=True if ativa is None or pd.isna(ativa) else bool(ativa),
+                                prioritaria=True, simples=True)))
+    return out
+
+
+NATUREZAS = {"Saída (pagamento)": "saida", "Entrada (recebimento)": "entrada", "Entrada ou saída": "ambos"}
+NATUREZA_ROT = {v: k for k, v in NATUREZAS.items()}
+
 with aba_cfg:
+    st.subheader("📌 Regras do cliente")
+    st.caption("Regras que o escritório já usa para este cliente. Valem **antes de tudo** e leem o extrato e o relatório do cliente. "
+               "No texto: palavras simples (sem acento ou com, tanto faz); **+** = todas as palavras precisam aparecer; "
+               "**vírgula** = qualquer uma. Exemplos: `EMPRESA Y` → Caixa · `COMISSAO, COMISSOES` → Caixa (saque) · `LEANDRO + CHINA` → 155.")
+    ops_cfg = opcoes_contas()
+    regras_cli = [r for r in perfil.regras if r.get("simples")]
+    df_rc = pd.DataFrame([{"Quando o texto tiver": r["padrao"], "Tipo": NATUREZA_ROT.get(r.get("natureza", "ambos"), "Entrada ou saída"),
+                           "Lançar em": rotulo(r["conta"]), "Histórico": r.get("historico", ""), "Ativa": r.get("ativa", True)}
+                          for r in regras_cli] or [{"Quando o texto tiver": "", "Tipo": "Saída (pagamento)", "Lançar em": "",
+                                                     "Histórico": "", "Ativa": True}][:0],
+                         columns=["Quando o texto tiver", "Tipo", "Lançar em", "Histórico", "Ativa"])
+    ed_rc = st.data_editor(df_rc, num_rows="dynamic", hide_index=True, width="stretch", key="cfg_regras_cliente",
+                           column_config={
+                               "Quando o texto tiver": st.column_config.TextColumn(width="medium", help="Ex.: EMPRESA Y  ·  COMISSAO, COMISSOES  ·  LEANDRO + CHINA"),
+                               "Tipo": st.column_config.SelectboxColumn(options=list(NATUREZAS), required=True, default="Saída (pagamento)"),
+                               "Lançar em": (st.column_config.SelectboxColumn(options=ops_cfg, width="medium") if ops_cfg
+                                             else st.column_config.TextColumn(help="Código da conta")),
+                               "Histórico": st.column_config.TextColumn(width="large", help="Ex.: VLR SAQUE BCO  ·  VLR REF. COMISSOES PAGAS"),
+                               "Ativa": st.column_config.CheckboxColumn(default=True),
+                           })
+    if not ops_cfg:
+        st.caption("Envie o razão na aba 1 para escolher as contas pelo nome (ou digite o código).")
+    perfil.lembretes = st.text_area("📝 Lembretes do cliente (aparecem no topo da revisão)", perfil.lembretes, height=90,
+                                    placeholder="Ex.: Pagamentos sem comprovante vão para Caixa. Conferir aluguel do sócio todo mês…")
+    if st.button("💾 Salvar regras e lembretes", type="primary", key="salvar_regras_cliente"):
+        novas = regras_do_editor(ed_rc)
+        perfil.regras = novas + [r for r in perfil.regras if not r.get("simples")]
+        perfil.salvar()
+        if SS.movs:
+            reclassificar()
+        st.success(f"{len(novas)} regra(s) do cliente salvas" + (" e lançamentos reclassificados." if SS.movs else "."))
+    st.divider()
+
     perfil.cnpj = st.text_input("CNPJ do cliente", perfil.cnpj, placeholder="00.000.000/0000-00",
                                 help="Usado para bloquear comprovantes do e-CAC de outra empresa.")
     st.subheader("Contas para juros e descontos")
@@ -844,14 +906,14 @@ with aba_cfg:
     else:
         ed_cod = None
 
-    st.subheader("Regras de classificação")
-    st.caption("Padrão = palavras do extrato (expressão regular, em maiúsculas sem acento; use | para ‘ou’). "
-               "Conta vazia = o programa descobre no razão qual conta você costuma usar.")
+    exp_regras = st.expander("Regras gerais do programa (avançado)")
+    exp_regras.caption("Regras padrão (tarifa, IOF, aplicação, impostos…). Padrão = expressão regular em maiúsculas sem acento; "
+                       "use | para ‘ou’. Conta vazia = o programa descobre no razão qual conta você costuma usar.")
     aprendidas = SS.get("contas_regra", {})
     df_r = pd.DataFrame([{**{"prioritaria": False}, **r, "conta": rotulo(r["conta"]) if r["conta"] else "",
                           "aprendida no razão": rotulo(aprendidas.get(r["nome"], ("", 0))[0]) if not r["conta"] else ""}
-                         for r in perfil.regras])
-    ed = st.data_editor(df_r, num_rows="dynamic", hide_index=True, width="stretch", key="cfg_regras",
+                         for r in perfil.regras if not r.get("simples")])
+    ed = exp_regras.data_editor(df_r, num_rows="dynamic", hide_index=True, width="stretch", key="cfg_regras",
                         column_config={
                             "nome": st.column_config.TextColumn("Nome", required=True),
                             "padrao": st.column_config.TextColumn("Padrão no extrato", width="large"),
@@ -905,7 +967,7 @@ with aba_cfg:
                                        natureza=str(r.get("natureza") or "ambos"), conta=cod_de(r.get("conta")),
                                        historico=str(r.get("historico") or ""), ativa=bool(r.get("ativa", True)),
                                        prioritaria=bool(r.get("prioritaria", False)))))
-        perfil.regras = regras
+        perfil.regras = regras_do_editor(ed_rc) + regras
         if ed_dp is not None:
             for _, r in ed_dp.iterrows():
                 cod = cod_de(r.get("Conta Steffen"))

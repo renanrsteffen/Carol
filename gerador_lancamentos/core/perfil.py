@@ -43,6 +43,7 @@ class Regra:
     historico: str = ""         # modelo de histórico
     ativa: bool = True
     prioritaria: bool = False   # vale antes da busca por cliente/fornecedor (ex.: retiradas de sócios)
+    simples: bool = False       # regra do cliente em linguagem simples (palavras, "+" e ",")
 
     def casa(self, texto_norm: str, entrada: bool) -> bool:
         if not self.ativa or not self.padrao:
@@ -50,6 +51,13 @@ class Regra:
         if self.natureza == "entrada" and not entrada:
             return False
         if self.natureza == "saida" and entrada:
+            return False
+        if self.simples:
+            # "EMPRESA Y, OUTRA EMPRESA" = qualquer uma;  "LEANDRO + CHINA" = todas as palavras
+            for alternativa in self.padrao.split(","):
+                palavras = [normalizar(p) for p in alternativa.split("+") if normalizar(p)]
+                if palavras and all(p in texto_norm for p in palavras):
+                    return True
             return False
         # forma simples: "FULANO + CHINA" = todas as partes precisam aparecer (em qualquer ordem)
         partes = [p.strip() for p in self.padrao.split(" + ")] if " + " in self.padrao else [self.padrao]
@@ -114,6 +122,7 @@ class Perfil:
     tolerancia_juros_pct: float = 10.0                       # diferença máxima (%) tratada como juros/desconto
     contas_retencao: dict = field(default_factory=dict)      # IRRF/PIS/COFINS/CSLL/ISS/INSS -> {cliente, fornecedor}
     contas_tributo: dict = field(default_factory=dict)       # SIMPLES/PIS/COFINS/.../MULTA/JUROS/OUTROS -> conta
+    lembretes: str = ""                                      # anotações livres do cliente (aparecem na revisão)
     depara_cliente: dict = field(default_factory=dict)       # conta do plano do cliente (extrato conciliado) -> conta Steffen
     conta_clientes_generica: str = ""                        # ex.: 121 CLIENTES NO PAIS (vazio = descobre sozinho)
     contas_codigo: dict = field(default_factory=dict)        # código de receita do DARF -> conta (definida pelo operador)

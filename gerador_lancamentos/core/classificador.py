@@ -830,7 +830,8 @@ class Classificador:
                             valor=it.valor if mov.entrada else -it.valor, conta_banco=mov.conta_banco, cnpj=mov.cnpj)
             texto_it = normalizar(f"{it.descricao} {it.nome}")
             obs_it = f"Relatório do cliente: {it.descricao}" + (f" (conta {it.conta_cliente} no sistema do cliente)" if it.conta_cliente else "")
-            rp = self._regra_prioritaria(sub, texto_it, nf="", obs=obs_it)
+            rp = self._regra_prioritaria(sub, f"{texto_it} {normalizar(mov.descricao)}" if len(itens) == 1 else texto_it,
+                                         nf="", obs=obs_it)
             if rp:
                 rp.descricao_extrato = mov.descricao
                 out.append(rp)
