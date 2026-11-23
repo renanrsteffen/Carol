@@ -62,7 +62,7 @@ def ler_ofx(dados: bytes) -> tuple[list[Movimento], dict]:
         return m[1].strip() if m else ""
 
     info = {
-        "banco": tag(texto, "BANKID") or tag(texto, "ORG"),
+        "banco": codigo_banco(tag(texto, "BANKID"), tag(texto, "ORG")),
         "conta": tag(texto, "ACCTID"),
         "saldo_final": parse_valor(tag(texto, "BALAMT")) if tag(texto, "BALAMT") else None,
     }
@@ -251,3 +251,17 @@ def _valor_pdf(t: str) -> float:
     neg = t.startswith("-") or t.endswith("-") or t.startswith("(") or t.rstrip().endswith("D")
     v = parse_valor(re.sub(r"[()\s+DC-]", "", t)) or 0.0
     return -abs(v) if neg else abs(v)
+
+
+def codigo_banco(bankid: str, org: str = "") -> str:
+    """Código COMPE de 3 dígitos (alguns OFX trazem '0104' ou um BANKID genérico)."""
+    o = normalizar(org)
+    if "MERCADO PAGO" in o:
+        return "323"
+    if "PAGSEGURO" in o or "PAGBANK" in o:
+        return "290"
+    d = re.sub(r"\D", "", bankid or "")
+    if not d:
+        return ""
+    d = str(int(d)).zfill(3)
+    return d if d != "001" or "BRASIL" in o or not o else ""

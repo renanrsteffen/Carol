@@ -19,6 +19,7 @@ from core.estado import competencia, desempacotar, empacotar
 from core.tributos import NOMES as NOMES_TRIBUTO
 from core.exportar import ROTULO_STATUS, gerar_conferencia, gerar_siger, validar
 from core.extratos import ler_extrato
+from core.conciliado import ler_conciliado
 from core.financeiro import ler_financeiro
 from core.modelos import Lancamento
 from core.perfil import MODELOS_PADRAO, Perfil, Regra
@@ -57,6 +58,22 @@ def init():
 
 
 init()
+
+
+@st.cache_resource(show_spinner="Lendo o razão…", max_entries=4)
+def _razao_em_cache(chave: str, _arquivos) -> Razao:
+    return Razao.carregar(_arquivos)
+
+
+def carregar_razao(arquivos) -> Razao:
+    """O razão de um ano inteiro pode levar vários segundos: lê uma vez por conjunto de arquivos.
+    Devolve uma cópia, porque a classificação ajusta tipos de conta."""
+    import hashlib
+    h = hashlib.md5()
+    for a in arquivos:
+        h.update(a.name.encode())
+        h.update(a.getvalue())
+    return copy.deepcopy(_razao_em_cache(h.hexdigest(), arquivos))
 
 
 def salvar_trabalho_atual():
@@ -187,6 +204,8 @@ def reclassificar():
     novos = clf.classificar(SS.movs)
     SS.comp_por_mov = {k: [(c.banco, c.agencia) for c in v] for k, v in clf._comp_por_mov.items()}
     SS.contas_tributo_sugeridas = clf.contas_tributo_sugeridas
+    SS.depara_sugerido = getattr(clf, "depara_sugerido", {})
+    SS.codigos_aprendidos = clf.codigos_aprendidos
     novos.sort(key=lambda l: (l.data, l.conta_banco, l.mov_id))
     SS.update(lancs=novos, titulos=clf.titulos, contas_regra=clf.contas_regra)
     SS.versao += 1
@@ -194,7 +213,7 @@ def reclassificar():
 
 
 def processar(razoes, plano, extratos_cfg, financeiros, comprovantes=None):
-    razao = Razao.carregar(razoes) if razoes else Razao()
+    razao = carregar_razao(razoes) if razoes else Razao()
     if plano:
         razao.aplicar_plano(ler_plano(plano))
     for cod, tipo in perfil.tipos_conta.items():
@@ -203,7 +222,7 @@ def processar(razoes, plano, extratos_cfg, financeiros, comprovantes=None):
     titulos = apurar_titulos(razao, perfil.tipos_conta)
     itens = []
     for f in financeiros or []:
-        itens.extend(ler_financeiro(f))
+        itens.extend(ler_conciliado(f) if f.name.lower().endswith(".pdf") else ler_financeiro(f))
     movs, totais = [], {}
     for movs_arq, conta in extratos_cfg:
         for m in movs_arq:
@@ -227,8 +246,8 @@ with aba_arq:
         razoes = st.file_uploader("Razão (Excel/CSV) — pode enviar mais de um", type=["xlsx", "xls", "csv"],
                                   accept_multiple_files=True, key="up_razao")
         plano = st.file_uploader("Plano de contas (opcional)", type=["xlsx", "xls", "csv"], key="up_plano")
-        financeiros = st.file_uploader("Relatório financeiro do cliente (opcional) — contas pagas/recebidas",
-                                       type=["xlsx", "xls", "csv"], accept_multiple_files=True, key="up_fin")
+        financeiros = st.file_uploader("Relatório financeiro do cliente (opcional) — contas pagas/recebidas ou extrato conciliado do sistema dele",
+                                       type=["xlsx", "xls", "csv", "pdf"], accept_multiple_files=True, key="up_fin")
     with c2:
         st.subheader("Extratos bancários")
         extratos = st.file_uploader("Extratos (OFX, Excel, CSV ou PDF)", type=["ofx", "qfx", "xlsx", "xls", "csv", "pdf"],
@@ -240,7 +259,7 @@ with aba_arq:
     razao_prev = None
     if razoes:
         try:
-            razao_prev = Razao.carregar(razoes)
+            razao_prev = carregar_razao(razoes)
             if plano:
                 razao_prev.aplicar_plano(ler_plano(plano))
             SS.razao = razao_prev
@@ -265,6 +284,11 @@ with aba_arq:
                 continue
             ident = info.get("conta") or Path(arq.name).stem
             atual = perfil.contas_banco.get(ident, "")
+            if not atual and razao_prev and info.get("banco"):
+                from core.tributos import conta_banco_do_comprovante
+                sug_b, conf_b = conta_banco_do_comprovante(info["banco"], "", perfil, razao_prev.contas, set())
+                if conf_b >= 90:
+                    atual = sug_b
             ent = sum(m.valor for m in movs_arq if m.valor > 0)
             sai = -sum(m.valor for m in movs_arq if m.valor < 0)
             per = f"{fmt_data(min(m.data for m in movs_arq))} a {fmt_data(max(m.data for m in movs_arq))}" if movs_arq else "—"
@@ -287,6 +311,8 @@ with aba_arq:
                     cod = st.text_input("Código da conta do banco", atual, key=f"bco_{arq.name}")
             if cod:
                 perfil.contas_banco[ident] = cod
+                if info.get("banco"):
+                    perfil.bancos_comprovante[info["banco"]] = cod
                 extratos_cfg.append((movs_arq, cod))
             if not movs_arq:
                 st.warning(f"{arq.name}: nenhum movimento encontrado. Se for PDF escaneado, prefira OFX ou Excel.")
@@ -369,7 +395,7 @@ def decidir(mov_id: str, decisao: dict | None, memorizar: bool = False):
         g = [l for l in SS.lancs if l.mov_id == mov_id]
         if g and g[0].conta_contra:
             mov = next((m for m in SS.movs if m.id == mov_id), None)
-            perfil.memorizar(g[0].descricao_extrato, g[0].conta_contra, g[0].historico,
+            perfil.memorizar(g[0].chave or g[0].descricao_extrato, g[0].conta_contra, g[0].historico,
                              cnpj=mov.cnpj if mov else None, parte=g[0].parte)
             perfil.salvar()
     SS.sel_mov = None   # a fila segue para o próximo
@@ -733,11 +759,58 @@ with aba_cfg:
             else:
                 perfil.bancos_comprovante.pop(chave)
 
+    itens_fin = SS.get("financeiro_itens", [])
+    codigos_cli = {}
+    for it in itens_fin:
+        if it.conta_cliente:
+            d = codigos_cli.setdefault(it.conta_cliente, {"n": 0, "total": 0.0, "exemplo": it.descricao})
+            d["n"] += 1
+            d["total"] += it.valor
+    if codigos_cli:
+        st.subheader("De-para: plano do cliente → plano Steffen")
+        st.caption("Cada linha do extrato conciliado do cliente traz a conta do plano dele. Informe a conta Steffen "
+                   "dos códigos que sempre vão para a mesma conta (tarifas, juros, aluguel…). Deixe vazio quando o código "
+                   "mistura vários fornecedores — aí o programa identifica pelo nome. Sugestão = o que as regras indicaram.")
+        sug_dp = SS.get("depara_sugerido", {})
+        df_dp = pd.DataFrame([{"Código do cliente": k, "Itens": v["n"], "Total": round(v["total"], 2),
+                               "Exemplo": v["exemplo"][:70],
+                               "Sugestão": rotulo(sug_dp.get(k, "")),
+                               "Conta Steffen": rotulo(perfil.depara_cliente.get(k, ""))}
+                              for k, v in sorted(codigos_cli.items(), key=lambda kv: -kv[1]["n"])])
+        ed_dp = st.data_editor(df_dp, hide_index=True, width="stretch", key="cfg_depara",
+                               column_config={"Código do cliente": st.column_config.TextColumn(disabled=True),
+                                              "Itens": st.column_config.NumberColumn(disabled=True),
+                                              "Total": st.column_config.NumberColumn(disabled=True, format="%.2f"),
+                                              "Exemplo": st.column_config.TextColumn(disabled=True, width="large"),
+                                              "Sugestão": st.column_config.TextColumn(disabled=True),
+                                              "Conta Steffen": (st.column_config.SelectboxColumn(options=ops, width="medium") if ops
+                                                                else st.column_config.TextColumn())})
+    else:
+        ed_dp = None
+
+    aprendidos = SS.get("codigos_aprendidos", {})
+    cods_vistos = sorted({it.codigo for c in SS.get("comprovantes", []) for it in c.itens if it.codigo} | set(perfil.contas_codigo))
+    if cods_vistos:
+        from core.ecac import DESCRICAO_CODIGO
+        st.subheader("Códigos de receita dos DARFs")
+        st.caption("Conta aprendida = como o escritório lançou esse código em meses anteriores (pelo razão). "
+                   "\"Total\" = multa e juros vão junto na mesma conta (ex.: parcelamentos). Informe a conta dos códigos novos.")
+        df_cod = pd.DataFrame([{"Código": c, "Descrição": DESCRICAO_CODIGO.get(c, ""),
+                                "Aprendida no razão": (rotulo(aprendidos[c]["conta"]) + (" (total)" if aprendidos[c]["modo"] == "total" else "")) if c in aprendidos else "",
+                                "Conta definida": rotulo(perfil.contas_codigo.get(c, ""))} for c in cods_vistos])
+        ed_cod = st.data_editor(df_cod, hide_index=True, width="stretch", key="cfg_codigos",
+                                column_config={"Código": st.column_config.TextColumn(disabled=True),
+                                               "Descrição": st.column_config.TextColumn(disabled=True),
+                                               "Aprendida no razão": st.column_config.TextColumn(disabled=True),
+                                               "Conta definida": (st.column_config.SelectboxColumn(options=ops) if ops else st.column_config.TextColumn())})
+    else:
+        ed_cod = None
+
     st.subheader("Regras de classificação")
     st.caption("Padrão = palavras do extrato (expressão regular, em maiúsculas sem acento; use | para ‘ou’). "
                "Conta vazia = o programa descobre no razão qual conta você costuma usar.")
     aprendidas = SS.get("contas_regra", {})
-    df_r = pd.DataFrame([{**r, "conta": rotulo(r["conta"]) if r["conta"] else "",
+    df_r = pd.DataFrame([{**{"prioritaria": False}, **r, "conta": rotulo(r["conta"]) if r["conta"] else "",
                           "aprendida no razão": rotulo(aprendidas.get(r["nome"], ("", 0))[0]) if not r["conta"] else ""}
                          for r in perfil.regras])
     ed = st.data_editor(df_r, num_rows="dynamic", hide_index=True, width="stretch", key="cfg_regras",
@@ -749,6 +822,7 @@ with aba_cfg:
                                       else st.column_config.TextColumn("Conta fixa")),
                             "historico": st.column_config.TextColumn("Histórico", width="large"),
                             "ativa": st.column_config.CheckboxColumn("Ativa"),
+                            "prioritaria": st.column_config.CheckboxColumn("Prioritária", help="Vale antes da busca por cliente/fornecedor. Use para retiradas de sócios e casos que o nome confundiria."),
                             "aprendida no razão": st.column_config.TextColumn(disabled=True),
                         })
 
@@ -791,8 +865,23 @@ with aba_cfg:
                 continue
             regras.append(asdict(Regra(nome=str(r["nome"]), padrao=str(r.get("padrao") or ""),
                                        natureza=str(r.get("natureza") or "ambos"), conta=cod_de(r.get("conta")),
-                                       historico=str(r.get("historico") or ""), ativa=bool(r.get("ativa", True)))))
+                                       historico=str(r.get("historico") or ""), ativa=bool(r.get("ativa", True)),
+                                       prioritaria=bool(r.get("prioritaria", False)))))
         perfil.regras = regras
+        if ed_dp is not None:
+            for _, r in ed_dp.iterrows():
+                cod = cod_de(r.get("Conta Steffen"))
+                if cod:
+                    perfil.depara_cliente[r["Código do cliente"]] = cod
+                else:
+                    perfil.depara_cliente.pop(r["Código do cliente"], None)
+        if ed_cod is not None:
+            for _, r in ed_cod.iterrows():
+                cod = cod_de(r.get("Conta definida"))
+                if cod:
+                    perfil.contas_codigo[r["Código"]] = cod
+                else:
+                    perfil.contas_codigo.pop(r["Código"], None)
         perfil.modelos = modelos
         if ed_t is not None:
             for _, r in ed_t.iterrows():

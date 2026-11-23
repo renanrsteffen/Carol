@@ -28,6 +28,7 @@ MODELOS_PADRAO = {
     "imposto_esporadico": "VLR. PAGO REF. {tributo} - DOC {doc}",
     "multa_tributo": "VLR. MULTA S/ PAGTO {tributo} PA {pa}",
     "juros_tributo": "VLR. JUROS S/ PAGTO {tributo} PA {pa}",
+    "transferencia": "VLR REF. TRANSFERENCIA ENTRE CONTAS - {banco}",
     "generico_saida": "VLR. PAGO REF. {descricao}",
     "generico_entrada": "VLR. RECEBIDO REF. {descricao}",
 }
@@ -41,6 +42,7 @@ class Regra:
     conta: str = ""             # contrapartida; vazio = aprender do razão
     historico: str = ""         # modelo de histórico
     ativa: bool = True
+    prioritaria: bool = False   # vale antes da busca por cliente/fornecedor (ex.: retiradas de sócios)
 
     def casa(self, texto_norm: str, entrada: bool) -> bool:
         if not self.ativa or not self.padrao:
@@ -49,19 +51,27 @@ class Regra:
             return False
         if self.natureza == "saida" and entrada:
             return False
-        try:
-            return re.search(self.padrao, texto_norm) is not None
-        except re.error:
-            return self.padrao.upper() in texto_norm
+        # forma simples: "FULANO + CHINA" = todas as partes precisam aparecer (em qualquer ordem)
+        partes = [p.strip() for p in self.padrao.split(" + ")] if " + " in self.padrao else [self.padrao]
+        for parte in partes:
+            alvo = normalizar(parte) if " + " in self.padrao else parte
+            try:
+                if re.search(alvo, texto_norm) is None:
+                    return False
+            except re.error:
+                if alvo.upper() not in texto_norm:
+                    return False
+        return True
 
 
 REGRAS_PADRAO = [
-    Regra("Tarifa bancária", r"\bTAR\b|TARIFA|\bTAR\.|CESTA|PACOTE (DE )?SERV|MANUT(ENCAO)? (DE )?CONTA|TX\.? |TAXA (DE )?(EMISSAO|MANUT|SERV|PIX|TED|DOC|BOLETO)|CUSTAS? (DE )?COBRANCA|TAR COBRANCA|DESP(ESAS)? COBRANCA", "saida", historico="VLR. REF. TARIFA BANCÁRIA CONF. EXTRATO"),
+    Regra("Tarifa bancária", r"\bTAR\b|TARIFA|\bTAR\.|CESTA|PACOTE (DE )?SERV|MANUT(ENCAO)? (DE )?CONTA|TX\.? |TAXA (DE )?(EMISSAO|MANUT|SERV|PIX|TED|DOC|BOLETO)|CUSTAS? (DE )?COBRANCA|TAR COBRANCA|DESP(ESAS)? COBRANCA|MANUTENCAO DE TITULOS|BAIXA DE TITULOS|CESTA (DE )?SERV|MENSALIDADE CESTA|TARIFA", "saida", historico="VLR. REF. TARIFA BANCÁRIA CONF. EXTRATO"),
     Regra("IOF", r"\bIOF\b", "saida", historico="VLR. REF. IOF CONF. EXTRATO"),
     Regra("Juros bancários pagos", r"JUROS (S/ ?)?(LIMITE|CHEQUE|SALDO|CONTA|ADIANT)|JUROS CH|ENCARGOS|JUROS MORA BANC|\bJUROS\b", "saida", historico="VLR. REF. JUROS BANCÁRIOS CONF. EXTRATO"),
-    Regra("Aplicação financeira", r"APLIC|APLICACAO|INVEST(IMENTO)?|CDB.*APL|APL\.? AUT|POUP.*APL", "saida", historico="VLR. REF. APLICAÇÃO FINANCEIRA"),
-    Regra("Resgate de aplicação", r"RESG|RESGATE|REG\.? APLIC|RESG\.? AUT", "entrada", historico="VLR. REF. RESGATE DE APLICAÇÃO FINANCEIRA"),
+    Regra("Aplicação financeira", r"APLIC|APLICACAO|INVEST(IMENTO)?|CDB.*APL|APL\.? AUT|POUP.*APL|RENDE FACIL|BB RENDE|INVEST FACIL|APLICACAO AUTOMATICA", "saida", historico="VLR. REF. APLICAÇÃO FINANCEIRA"),
+    Regra("Resgate de aplicação", r"RESG|RESGATE|REG\.? APLIC|RESG\.? AUT|RENDE FACIL|BB RENDE|INVEST FACIL", "entrada", historico="VLR. REF. RESGATE DE APLICAÇÃO FINANCEIRA"),
     Regra("Rendimento de aplicação", r"REND(IMENTO)?S?\b|REND PAGO|RENDIMENTOS?", "entrada", historico="VLR. REF. RENDIMENTO DE APLICAÇÃO FINANCEIRA"),
+    Regra("Juros recebidos", r"JUROS RECEBIDOS|JUROS DE MORA|JUROS S/ ?ATRASO|MULTA RECEBIDA", "entrada", historico="VLR. REF. JUROS RECEBIDOS"),
     Regra("Telefone / internet", r"TELEFON|\bVIVO\b|\bCLARO\b|\bTIM\b|\bOI\b|EMBRATEL|NET SERV|TELECOM|INTERNET|ALGAR", "saida", historico="VLR. PAGO REF. DESPESA COM TELEFONE/INTERNET - {parte}"),
     Regra("Energia elétrica", r"ENERGIA|CELESC|CEMIG|COPEL|CPFL|\bENEL\b|\bRGE\b|ELETROPAULO|EQUATORIAL|NEOENERGIA|COELBA|LIGHT S", "saida", historico="VLR. PAGO REF. ENERGIA ELÉTRICA - {parte}"),
     Regra("Água e esgoto", r"SANEAMENTO|CASAN|SABESP|CORSAN|SANEPAR|SAMAE|COPASA|EMBASA|SEMAE|\bDAE\b AGUA|AGUA E ESGOTO", "saida", historico="VLR. PAGO REF. ÁGUA E ESGOTO - {parte}"),
@@ -101,6 +111,9 @@ class Perfil:
     tolerancia_juros_pct: float = 10.0                       # diferença máxima (%) tratada como juros/desconto
     contas_retencao: dict = field(default_factory=dict)      # IRRF/PIS/COFINS/CSLL/ISS/INSS -> {cliente, fornecedor}
     contas_tributo: dict = field(default_factory=dict)       # SIMPLES/PIS/COFINS/.../MULTA/JUROS/OUTROS -> conta
+    depara_cliente: dict = field(default_factory=dict)       # conta do plano do cliente (extrato conciliado) -> conta Steffen
+    conta_clientes_generica: str = ""                        # ex.: 121 CLIENTES NO PAIS (vazio = descobre sozinho)
+    contas_codigo: dict = field(default_factory=dict)        # código de receita do DARF -> conta (definida pelo operador)
     bancos_comprovante: dict = field(default_factory=dict)   # "001|1234" ou "001" -> conta do banco
     tipos_conta: dict = field(default_factory=dict)          # código -> cliente | fornecedor | banco | outra
     modelos: dict = field(default_factory=lambda: dict(MODELOS_PADRAO))

@@ -109,7 +109,7 @@ def sugerir_contas(contas: dict[str, Conta]) -> dict[str, str]:
             out[chave] = max(cands)[1]
     for c in lista:
         n = normalizar(c.nome)
-        if re.search(r"IMPOSTOS E TAXAS|TAXAS E IMPOSTOS|IMPOSTOS, TAXAS|IMPOSTOS TAXAS|TAXAS DIVERSAS|TRIBUTOS DIVERSOS|DESPESAS TRIBUTARIAS", n) \
+        if re.search(r"IMPOSTOS E TAXAS|TAXAS E IMPOSTOS|IMPOSTOS, TAXAS|IMPOSTOS TAXAS|TAXAS DIVERSAS|TRIBUTOS DIVERSOS|DESPESAS TRIBUTARIAS|TAXAS E CONTRIBUICOES", n) \
                 and not c.classificacao.startswith(("1", "2")):
             out["OUTROS"] = c.codigo
             break
@@ -147,3 +147,85 @@ def conta_banco_do_comprovante(banco: str, agencia: str, perfil, contas: dict[st
     if len(extrato_ok) == 1 and not contas_banco:
         return extrato_ok[0], 60
     return "", 0
+
+
+# ---------------------------------------------------------------------------------------------
+def aprender_codigos(comprovantes, razao) -> dict[str, dict]:
+    """Aprende no razão como cada código de receita foi lançado em meses anteriores.
+
+    Para cada pagamento do e-CAC já coberto pelo razão, procura o crédito no banco do mesmo dia
+    com o mesmo valor (total, principal, multa ou juros) ou com a soma dos pagamentos do dia
+    (ex.: tributos de importação debitados juntos). Resultado por código:
+      {"conta": conta mais usada, "modo": "total" | "principal", "por_valor": [(principal, conta)],
+       "multa": conta, "juros": conta, "votos": n}
+    """
+    from collections import Counter, defaultdict
+    if not comprovantes or razao is None or not razao.movimentos:
+        return {}
+    fim_razao = max(m.data for m in razao.movimentos)
+    bancos = {c.codigo for c in razao.contas.values() if c.tipo == "banco"}
+    creditos = defaultdict(list)
+    for m in razao.movimentos:
+        if m.conta in bancos and m.credito and m.contrapartida:
+            creditos[m.data].append(m)
+    por_dia = defaultdict(list)
+    for c in comprovantes:
+        if c.data_arrecadacao:
+            por_dia[c.data_arrecadacao].append(c)
+    votos: dict[str, dict] = defaultdict(lambda: {"total": Counter(), "principal": Counter(), "multa": Counter(),
+                                                  "juros": Counter(), "por_valor": []})
+    for c in comprovantes:
+        d = c.data_arrecadacao
+        if not d or d > fim_razao or len(c.itens) != 1:
+            continue
+        it = c.itens[0]
+        v = votos[it.codigo]
+        achou = False
+        mesmos = Counter(round(m.credito, 2) for m in creditos.get(d, []))
+        for m in creditos.get(d, []):
+            if mesmos[round(m.credito, 2)] > 1 or (m.credito < 100 and not re.search(r"DARF|IMPOST|TRIBUT|RECEITA|ARRECAD|SIMPLES|PARCEL|INSS|IRPJ|CSLL|PIS|COFINS|IPI|ICMS|IMPORT|SISCOMEX|AFRMM|TAXA", normalizar(m.historico))):
+                continue  # valor repetido no dia ou valor pequeno sem histórico de imposto: pode ser coincidência
+            if abs(m.credito - it.total) < 0.011:
+                v["total" if (it.multa or it.juros) else "principal"][m.contrapartida] += 1
+                v["por_valor"].append((it.principal, m.contrapartida))
+                achou = True
+            elif it.multa or it.juros:
+                if abs(m.credito - it.principal) < 0.011:
+                    v["principal"][m.contrapartida] += 1
+                    v["por_valor"].append((it.principal, m.contrapartida))
+                    achou = True
+                if it.multa and abs(m.credito - it.multa) < 0.011:
+                    v["multa"][m.contrapartida] += 1
+                if it.juros and abs(m.credito - it.juros) < 0.011:
+                    v["juros"][m.contrapartida] += 1
+        if not achou and len(por_dia[d]) > 1:
+            soma = round(sum(x.total for x in por_dia[d]), 2)
+            for m in creditos.get(d, []):
+                if abs(m.credito - soma) < 0.011:
+                    v["total"][m.contrapartida] += 1
+                    v["por_valor"].append((it.principal, m.contrapartida))
+    out = {}
+    for cod, v in votos.items():
+        modo = "total" if sum(v["total"].values()) > sum(v["principal"].values()) else "principal"
+        cont = v[modo] or v["total"] or v["principal"]
+        if not cont:
+            continue
+        conta, n = cont.most_common(1)[0]
+        out[cod] = {"conta": conta, "modo": modo, "por_valor": v["por_valor"], "votos": n,
+                    "multa": v["multa"].most_common(1)[0][0] if v["multa"] else "",
+                    "juros": v["juros"].most_common(1)[0][0] if v["juros"] else ""}
+    return out
+
+
+def conta_por_codigo(aprendido: dict, codigo: str, principal: float) -> tuple[str, str, bool]:
+    """(conta, modo, certeza). Com várias contas para o mesmo código (ex.: parcelamentos diferentes),
+    escolhe a do pagamento anterior de principal mais próximo."""
+    a = aprendido.get(codigo)
+    if not a:
+        return "", "", False
+    contas = {c for _, c in a["por_valor"]}
+    if len(contas) <= 1:
+        return a["conta"], a["modo"], True
+    melhor = min(a["por_valor"], key=lambda pv: abs(pv[0] - principal))
+    certeza = abs(melhor[0] - principal) <= max(1.0, principal * 0.05)
+    return (melhor[1] if certeza else a["conta"]), a["modo"], certeza

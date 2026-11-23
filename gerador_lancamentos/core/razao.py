@@ -69,7 +69,7 @@ CABECALHOS = {
     "contrapartida": [r"CONTRAPARTIDA", r"^C\.?\s?PARTIDA", r"^CONTRA"],
     "conta": [r"^CONTA$", r"^CONTA CONTABIL", r"^COD.*CONTA", r"^CONTA ANALITICA"],
     "nome_conta": [r"^NOME DA CONTA", r"^DESCRICAO DA CONTA"],
-    "documento": [r"^DOC", r"^NUMERO DO DOC", r"^N.? DOC"],
+    "documento": [r"^DOC", r"^NUMERO DO DOC", r"^N\.?\s?DOC", r"^NF$", r"^NOTA"],
 }
 
 
@@ -116,7 +116,9 @@ def _parse_rotulo_conta(texto: str) -> tuple[str, str, str]:
             resto.append(" ".join(sub))
     nome = " - ".join(resto).strip(" -")
     if not codigo:
-        codigo = classif
+        # SIGER: classificação completa 1.1.1.02.02.00205 -> código reduzido 205 (último grupo)
+        m = re.fullmatch(r"\d+(?:\.\d+){3,}\.(\d{3,})", classif)
+        codigo = str(int(m[1])) if m else classif
     return codigo, classif, nome
 
 
@@ -130,6 +132,7 @@ class Razao:
         self.movimentos: list[MovRazao] = []
         self.avisos: list[str] = []
         self.saldos_anteriores: dict[str, tuple[float, bool, object]] = {}  # conta -> (valor, sinal explícito, data)
+        self.saldo_devedor_positivo = False
 
     # ------------------------------------------------------------------ carga
     @classmethod
@@ -143,12 +146,14 @@ class Razao:
         r._classificar_contas()
         return r
 
-    def _conta(self, codigo: str, nome: str = "", classif: str = "") -> Conta:
+    def _conta(self, codigo: str, nome: str = "", classif: str = "", grupo: str = "") -> Conta:
         c = self.contas.get(codigo)
         if c is None:
-            c = Conta(codigo=codigo, nome=nome or codigo, classificacao=classif)
+            c = Conta(codigo=codigo, nome=nome or codigo, classificacao=classif, grupo=grupo)
             self.contas[codigo] = c
         else:
+            if grupo:
+                c.grupo = grupo
             if nome and (c.nome == c.codigo or not c.nome):
                 c.nome = nome
             if classif and not c.classificacao:
@@ -158,6 +163,7 @@ class Razao:
     def _ler_grade(self, linhas: list[list]) -> None:
         mapa: dict[str, int] = {}
         conta_atual = ""
+        grupo_atual = ""
         ultimo: MovRazao | None = None
         ano_ref = None
         for bruta in linhas:
@@ -168,6 +174,14 @@ class Razao:
             junto = " ".join(ne)
             jn = normalizar(junto)
 
+            # grupo do plano (SIGER): "Grupo: 1.1.1.02.02 BANCOS CONTA MOVIMENTO"
+            mg = re.match(r"^GRUPO\s*:?\s*[\d.]+\s+(.*)$", jn)
+            if mg:
+                grupo_atual = mg[1].strip()
+                continue
+            if "LDO EXERCICIO" in jn or "SALDO EXERCICIO" in jn:
+                self.saldo_devedor_positivo = True   # SIGER: saldo = débitos - créditos
+
             # cabeçalho de conta: "Conta: 15 - 1.1.1.02.001 - BANCO ITAU"
             m = RE_LINHA_CONTA.match(jn)
             if m and ":" in junto[:20] and not parse_data(linha[mapa["data"]] if "data" in mapa and mapa["data"] < len(linha) else None):
@@ -175,7 +189,7 @@ class Razao:
                 cod, classif, nome = _parse_rotulo_conta(bruto)
                 if cod:
                     conta_atual = cod
-                    self._conta(cod, nome, classif)
+                    self._conta(cod, nome, classif, grupo_atual)
                     ultimo = None
                 continue
 
@@ -197,7 +211,7 @@ class Razao:
             jh = normalizar(hist) or jn
             if re.match(r"^(SALDO ANTERIOR|SALDO INICIAL)", jh) or re.search(r"\bSALDO ANTERIOR\b", jn[:40]):
                 bruto_saldo = col("saldo") or col("debito") or col("credito") or next(
-                    (c for c in reversed(linha) if parse_valor(c) is not None and re.search(r"\d,\d{2}|\d\.\d{2}|^\d+$", c)), "")
+                    (c for c in reversed(linha) if parse_valor(c) is not None and re.search(r"\d,\d{2}|\d\.\d{1,2}$|^-?\d+$", c)), "")
                 v = parse_valor(bruto_saldo)
                 if conta_atual and v:
                     explicito = bool(re.search(r"[DC]\s*$|^-|-$|\(", str(bruto_saldo).strip().upper()))
@@ -205,6 +219,8 @@ class Razao:
                         v, explicito = abs(v), True
                     elif col("debito") and not col("saldo"):
                         v, explicito = -abs(v), True
+                    if self.saldo_devedor_positivo and not re.search(r"[DC]\s*$", str(bruto_saldo).strip().upper()):
+                        v, explicito = -v, True   # converte para a convenção interna (credor positivo)
                     self.saldos_anteriores[conta_atual] = (v, explicito, data)
                 continue
             deb = parse_valor(col("debito")) or 0.0
@@ -281,6 +297,17 @@ class Razao:
         for cod, c in self.contas.items():
             nome = normalizar(c.nome)
             ms = por_conta.get(cod, [])
+            if c.grupo:  # o nome do grupo do plano decide (razão do SIGER)
+                g = normalizar(c.grupo)
+                if re.search(r"^BANCOS?\b|CONTA MOVIMENTO|CONTAS? CORRENTES?", g):
+                    c.tipo = "banco"
+                elif re.match(r"^(CLIENTES|DUPLICATAS A RECEBER|CONTAS A RECEBER)", g):
+                    c.tipo = "cliente"
+                elif re.match(r"^(FORNECEDORES|CONTAS A PAGAR)", g):
+                    c.tipo = "fornecedor"
+                else:
+                    c.tipo = "outra"
+                continue
             if RE_BANCO.search(nome) and not RE_NAO_BANCO.search(nome):
                 c.tipo = "banco"
                 continue

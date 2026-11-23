@@ -4,7 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .classificador import Classificador, Contexto
+from .ecac import ler_comprovantes
 from .extratos import ler_extrato
+from .conciliado import ler_conciliado
 from .financeiro import ler_financeiro
 from .modelos import Lancamento, Movimento, Titulo
 from .perfil import Perfil
@@ -21,9 +23,9 @@ class Resultado:
 
 
 def processar(perfil: Perfil, razoes: list, extratos: list[tuple], financeiros: list | None = None,
-              plano=None) -> Resultado:
+              plano=None, comprovantes: list | None = None, razao: Razao | None = None) -> Resultado:
     """extratos: lista de (arquivo, código da conta banco)."""
-    razao = Razao.carregar(razoes) if razoes else Razao()
+    razao = razao or (Razao.carregar(razoes) if razoes else Razao())
     if plano is not None:
         razao.aplicar_plano(ler_plano(plano))
     for cod, tipo in perfil.tipos_conta.items():
@@ -32,11 +34,14 @@ def processar(perfil: Perfil, razoes: list, extratos: list[tuple], financeiros: 
     titulos = apurar_titulos(razao, perfil.tipos_conta)
     itens = []
     for f in financeiros or []:
-        itens.extend(ler_financeiro(f))
+        nome = str(getattr(f, "name", f)).lower()
+        itens.extend(ler_conciliado(f) if nome.endswith(".pdf") else ler_financeiro(f))
     movs: list[Movimento] = []
     totais: dict = {}
     for arq, conta in extratos:
         lidos, _info = ler_extrato(arq)
+        if _info.get("banco"):
+            perfil.bancos_comprovante.setdefault(_info["banco"], conta)
         for m in lidos:
             m.conta_banco = conta
         movs.extend(lidos)
@@ -44,6 +49,11 @@ def processar(perfil: Perfil, razoes: list, extratos: list[tuple], financeiros: 
         s = -sum(m.valor for m in lidos if m.valor < 0)
         te, ts = totais.get(conta, (0.0, 0.0))
         totais[conta] = (te + e, ts + s)
-    clf = Classificador(Contexto(perfil=perfil, razao=razao, titulos=titulos, financeiro=itens))
+    comps = []
+    for f in comprovantes or []:
+        comps.extend(ler_comprovantes(f))
+    clf = Classificador(Contexto(perfil=perfil, razao=razao, titulos=titulos, financeiro=itens, comprovantes=comps))
     lancs = clf.classificar(movs)
-    return Resultado(lancs, titulos, razao, movs, totais)
+    res = Resultado(lancs, titulos, razao, movs, totais)
+    res.classificador = clf
+    return res

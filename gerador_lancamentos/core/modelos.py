@@ -11,6 +11,7 @@ class Conta:
     nome: str
     classificacao: str = ""     # ex.: 2.1.1.01.0005
     tipo: str = "outra"         # banco | cliente | fornecedor | outra
+    grupo: str = ""             # nome do grupo no razão (ex.: "FORNECEDORES NO PAIS")
 
     @property
     def rotulo(self) -> str:
@@ -80,6 +81,8 @@ class ItemFinanceiro:
     descricao: str = ""
     tipo: str = ""             # pagar | receber | ""
     usado: bool = False
+    conta_cliente: str = ""    # código da conta no sistema do cliente (extrato conciliado)
+    banco: str = ""            # código do banco (001, 748...) quando o relatório é por banco
 
 
 @dataclass
@@ -101,4 +104,5 @@ class Lancamento:
     parte: str = ""
     motivo: str = ""           # resumo curto do que pede atenção (ex.: "Parcela de nota")
     alternativas: list = field(default_factory=list)   # [{conta, nfs, texto}] outras possibilidades
+    chave: str = ""            # texto usado para memorizar (descrição do relatório do cliente, quando houver)
     principal: bool = True     # False = linha complementar (juros, retenção, desconto) do mesmo movimento

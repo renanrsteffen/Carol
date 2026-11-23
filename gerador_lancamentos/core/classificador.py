@@ -21,7 +21,7 @@ from datetime import timedelta
 from rapidfuzz import fuzz
 
 from .busca import Candidato, buscar, melhor_entre_contas
-from .tributos import NOMES, conta_banco_do_comprovante, identificar, sugerir_contas
+from .tributos import NOMES, aprender_codigos, conta_banco_do_comprovante, conta_por_codigo, identificar, sugerir_contas
 from .modelos import Conta, ItemFinanceiro, Lancamento, Movimento, MovRazao, Titulo
 from .perfil import MODELOS_PADRAO, RUIDO_BANCARIO, Perfil, Regra, chave_memoria
 from .razao import Razao
@@ -78,6 +78,62 @@ class Classificador:
         sugeridas = sugerir_contas(self.contas)
         self.contas_tributo = {**sugeridas, **{k: v for k, v in self.perfil.contas_tributo.items() if v}}
         self.contas_tributo_sugeridas = sugeridas
+        self.codigos_aprendidos = aprender_codigos(self.comprovantes, self.razao)
+        self._banco_id: dict[str, str] = {v: k for k, v in self.perfil.bancos_comprovante.items() if "|" not in k}
+        self.conta_clientes_generica = self.perfil.conta_clientes_generica or self._achar_clientes_generica()
+        self.dominante = self._contas_dominantes()
+        self.depara = {**self._depara_automatico(), **{k: v for k, v in self.perfil.depara_cliente.items() if v}}
+
+    def _depara_automatico(self) -> dict[str, str]:
+        """Conta do plano do cliente -> conta Steffen, quando as regras apontam a mesma conta para quase todos
+        os itens daquele código (ex.: 390 'tarifa' -> despesas bancárias)."""
+        votos: dict[str, Counter] = defaultdict(Counter)
+        total: Counter = Counter()
+        for it in self.financeiro:
+            if not it.conta_cliente:
+                continue
+            total[it.conta_cliente] += 1
+            texto = normalizar(f"{it.descricao} {it.nome}")
+            entrada = it.tipo == "receber"
+            for r in self.regras:
+                if not r.prioritaria and r.casa(texto, entrada):
+                    conta = self.contas_regra.get(r.nome, ("", 0))[0]
+                    if conta:
+                        votos[it.conta_cliente][conta] += 1
+                    break
+        out = {}
+        for cod, v in votos.items():
+            conta, n = v.most_common(1)[0]
+            if n >= 2 and n / total[cod] >= 0.8:
+                out[cod] = conta
+        self.depara_sugerido = out
+        return out
+
+    def _contas_dominantes(self) -> dict[tuple[str, bool], tuple[str, str, float]]:
+        """(banco, entrada) -> (conta, histórico, fração) quando a maioria dos lançamentos do banco vai para uma conta."""
+        cont: dict[tuple[str, bool], Counter] = defaultdict(Counter)
+        hist: dict[tuple[str, bool, str], Counter] = defaultdict(Counter)
+        for m in self.razao.movimentos_banco(self._bancos()):
+            k = (m.conta, m.debito > 0)
+            cont[k][m.contrapartida] += 1
+            hist[(m.conta, m.debito > 0, m.contrapartida)][m.historico] += 1
+        out = {}
+        for k, c in cont.items():
+            total = sum(c.values())
+            conta, n = c.most_common(1)[0]
+            if total >= 20 and n / total >= 0.75 and conta not in self._bancos():
+                h = hist[(k[0], k[1], conta)].most_common(1)[0][0]
+                out[k] = (conta, h, n / total)
+        return out
+
+    def _achar_clientes_generica(self) -> str:
+        """Conta de clientes usada para todos os compradores (muitas notas de nomes diferentes)."""
+        cont = Counter(t.conta for t in self.titulos if t.tipo == "cliente")
+        for cod, n in cont.most_common(1):
+            c = self.contas.get(cod)
+            if c and n >= 30 and re.search(r"CLIENTES|DUPLICATAS|CONTAS A RECEBER", normalizar(c.nome)):
+                return cod
+        return ""
 
     # ------------------------------------------------------------------ aprendizado
     def _bancos(self) -> set[str]:
@@ -163,7 +219,7 @@ class Classificador:
                 if alvo.split()[0] == nome.split()[0] and len(alvo.split()[0]) >= 4:
                     s += 5
                 if tipo != tipo_pref:
-                    s -= 8
+                    s -= 12   # recebimento casando com fornecedor (ou pagamento com cliente) só com nome quase idêntico
                 if s > melhor_s:
                     melhor, melhor_s = c, s
             if melhor_s >= 92:
@@ -187,6 +243,7 @@ class Classificador:
         saida: list[Lancamento] = []
         usados_razao: set[int] = set()
         movimentos = list(movimentos) + self._preparar_comprovantes(movimentos)
+        self._transferencias = self._achar_transferencias(movimentos)
         for mov in sorted(movimentos, key=lambda m: (m.data, m.valor)):
             f = self.ctx.forcados.get(mov.id)
             ls = self._forcado(mov, f) if f and (f.get("conta") or f.get("ignorar")) else self._classificar_um(mov, usados_razao)
@@ -203,8 +260,42 @@ class Classificador:
                         ls[0].motivo = ""
             for i, l in enumerate(ls):
                 l.principal = i == 0
+                if l.status == "pendente" and not l.motivo:
+                    l.motivo = "Conta não identificada"
+            if ls:
+                pior = min(ls, key=lambda l: {"pendente": 0, "revisar": 1}.get(l.status, 9))
+                if pior is not ls[0] and pior.status in ("pendente", "revisar") and ls[0].status not in ("pendente",):
+                    ls[0].motivo = ls[0].motivo or (pior.motivo + f" ({pior.valor:.2f})".replace(".", ","))
+                    if pior.observacao:
+                        ls[0].observacao = (ls[0].observacao + " | " + pior.observacao).strip(" |")
             saida.extend(ls)
         return saida
+
+    def _achar_transferencias(self, movimentos: list[Movimento]) -> dict[str, tuple[Movimento, bool]]:
+        """Saída num banco e entrada de mesmo valor em outro banco do cliente (mesmo dia ou dia seguinte).
+        A saída gera o lançamento; a entrada fica marcada para não duplicar."""
+        RE_TRANSF = re.compile(r"TRANSF|TED|DOC|PIX|ENTRE CONTAS|MESMA TITULARIDADE|APLIC|RESG|DEPOSITO|SAQUE")
+        cnpj = re.sub(r"\D", "", self.perfil.cnpj or "")
+        entradas = defaultdict(list)
+        for m in movimentos:
+            if m.valor > 0 and m.conta_banco:
+                entradas[round(m.valor, 2)].append(m)
+        out: dict[str, tuple[Movimento, bool]] = {}
+        usados: set[str] = set()
+        for m in sorted((x for x in movimentos if x.valor < 0 and x.conta_banco), key=lambda x: x.data):
+            cands = [e for e in entradas.get(round(-m.valor, 2), []) if e.id not in usados and e.conta_banco != m.conta_banco
+                     and 0 <= (e.data - m.data).days <= 1]
+            if not cands:
+                continue
+            texto = normalizar(m.descricao) + " " + normalizar(cands[0].descricao)
+            mesmo_titular = bool(cnpj and (cnpj[:8] in re.sub(r"\D", "", m.descricao + cands[0].descricao)))
+            if not (RE_TRANSF.search(texto) or mesmo_titular) and len(cands) > 1:
+                continue
+            e = min(cands, key=lambda x: (x.data - m.data).days)
+            usados.add(e.id)
+            out[m.id] = (e, True)
+            out[e.id] = (m, False)
+        return out
 
     # ------------------------------------------------------------------ comprovantes e-CAC
     def _preparar_comprovantes(self, movimentos: list[Movimento]) -> list[Movimento]:
@@ -216,6 +307,11 @@ class Classificador:
         if not self.comprovantes:
             return []
         bancos_extrato = {m.conta_banco for m in movimentos}
+        if movimentos:
+            # só os pagamentos do período dos extratos (a relação do e-CAC costuma cobrir o ano todo)
+            ini, fim = min(m.data for m in movimentos), max(m.data for m in movimentos)
+            self.comprovantes = [c for c in self.comprovantes
+                                 if c.data_arrecadacao is None or ini <= c.data_arrecadacao <= fim]
         for c in self.comprovantes:
             conta, conf = conta_banco_do_comprovante(c.banco, c.agencia, self.perfil, self.contas, bancos_extrato)
             c._conta_banco, c._conf_banco = conta, conf
@@ -280,6 +376,7 @@ class Classificador:
                 alerta = (status, motivo, obs)
 
         for c in comps:
+            c._mj_incluido = 0.0
             pa, doc = c.pa_texto, c.numero
             nomes = []
             linhas_c: list[tuple[str, str, float, str]] = []   # (tributo, conta, valor, historico)
@@ -289,6 +386,27 @@ class Classificador:
                 nomes.append("SIMPLES NACIONAL")
             else:
                 for it in c.itens:
+                    conta_ap, modo, certeza = conta_por_codigo(self.codigos_aprendidos, it.codigo, it.principal)
+                    conta_ap = self.perfil.contas_codigo.get(it.codigo) or conta_ap
+                    if conta_ap:
+                        nome = descricao_curta(it.denominacao)[:45]
+                        if nome.startswith("RECEITA ") and conta_ap in self.contas:
+                            nome = f"{self.nome_conta(conta_ap).upper()} (COD. {it.codigo})"
+                        nomes.append(nome)
+                        if modo == "total":
+                            valor_l = it.total
+                            multa_juros_ja = True
+                        else:
+                            valor_l = it.principal
+                            multa_juros_ja = False
+                        hist = self._modelo("imposto_pago", tributo=nome, pa=pa, doc=doc)
+                        linhas_c.append((f"COD{it.codigo}", conta_ap, valor_l, hist))
+                        if multa_juros_ja:
+                            c._mj_incluido = getattr(c, "_mj_incluido", 0.0) + it.multa + it.juros
+                        if not certeza and not self.perfil.contas_codigo.get(it.codigo):
+                            piora("revisar", "Confirme a conta do código " + it.codigo,
+                                  f"O código {it.codigo} já foi lançado em mais de uma conta; usada a do valor mais parecido")
+                        continue
                     trib, recorrente = identificar(it.codigo, it.denominacao, c.tipo)
                     nome = NOMES.get(trib) if trib != "OUTROS" else (descricao_curta(it.denominacao)[:45] or "TAXA/IMPOSTO")
                     nomes.append(nome)
@@ -312,13 +430,18 @@ class Classificador:
                               f"Código {it.codigo or 's/c'} {it.denominacao[:60]}")
                     linhas_c.append((trib, conta, it.principal, hist))
             tribs = ", ".join(dict.fromkeys(nomes))[:60]
-            if c.multa:
-                linhas_c.append(("MULTA", self.contas_tributo.get("MULTA", ""), c.multa,
+            ja_incluido = round(getattr(c, "_mj_incluido", 0.0), 2)
+            if ja_incluido and ja_incluido >= round(c.multa + c.juros, 2):
+                c_multa = c_juros = 0.0   # parcelamentos: o escritório lança o total na conta do parcelamento
+            else:
+                c_multa, c_juros = c.multa, c.juros
+            if c_multa:
+                linhas_c.append(("MULTA", self.contas_tributo.get("MULTA", ""), c_multa,
                                  self._modelo("multa_tributo", tributo=tribs, pa=pa, doc=doc)))
                 if not self.contas_tributo.get("MULTA"):
                     piora("pendente", "Conta de multas não definida", "Informe a conta em Configurações › Impostos")
-            if c.juros:
-                linhas_c.append(("JUROS", self.contas_tributo.get("JUROS", ""), c.juros,
+            if c_juros:
+                linhas_c.append(("JUROS", self.contas_tributo.get("JUROS", ""), c_juros,
                                  self._modelo("juros_tributo", tributo=tribs, pa=pa, doc=doc)))
                 if not self.contas_tributo.get("JUROS"):
                     piora("pendente", "Conta de juros não definida", "Informe a conta em Configurações › Impostos")
@@ -408,11 +531,35 @@ class Classificador:
                                    origem="Já consta no razão", confianca=100,
                                    observacao=f"Lote {m.lote} lanç. {m.lancamento}".strip())]
 
+        # 1a) transferência entre contas próprias (aparece nos dois extratos)
+        if mov.id in self._transferencias:
+            outro, lanca = self._transferencias[mov.id]
+            hist = self._modelo("transferencia", banco=self.nome_conta(outro.conta_banco))
+            if lanca:
+                return [self._base(mov, conta_contra=outro.conta_banco, historico=hist, status="ok",
+                                   origem="Transferência entre contas", confianca=97,
+                                   observacao=f"Par no extrato de {self.nome_conta(outro.conta_banco)} em {outro.data:%d/%m}")]
+            return [self._base(mov, conta_contra=outro.conta_banco, historico=hist, status="ja_lancado",
+                               origem="Transferência entre contas", confianca=100, motivo="Lançada pela outra conta",
+                               observacao=f"Lançada no extrato de {self.nome_conta(outro.conta_banco)} (evita duplicidade)")]
+
         # 1b) comprovante de pagamento do e-CAC
         if mov.id in self._comp_por_mov:
             return self._lancar_comprovantes(mov, self._comp_por_mov[mov.id])
 
-        # 2) memória
+        # 2) relatório financeiro do cliente (detalhe por movimento)
+        itens = self._casar_financeiro(mov)
+        if itens:
+            r = self._lancar_financeiro(mov, itens)
+            if r:
+                return r
+
+        # 2b) regras prioritárias (ex.: retiradas de sócios)
+        rp = self._regra_prioritaria(mov, texto)
+        if rp:
+            return [rp]
+
+        # 3) memória
         mem = self.perfil.memoria.get(chave_memoria(mov.descricao))
         if mem and mem.get("conta"):
             conta = mem["conta"]
@@ -425,13 +572,6 @@ class Classificador:
                             nf="", mes=_mes(mov))
             return [self._base(mov, conta_contra=conta, historico=hist or self._generico(mov),
                                status="ok", origem="Memória do cliente", confianca=96)]
-
-        # 3) relatório financeiro do cliente
-        itens = self._casar_financeiro(mov)
-        if itens:
-            r = self._lancar_financeiro(mov, itens)
-            if r:
-                return r
 
         # 4) cliente/fornecedor pelo nome/CNPJ
         parte, score = self.identificar_parte(mov)
@@ -470,6 +610,14 @@ class Classificador:
                                motivo="Semelhança com o razão" if conf < 85 else "",
                                confianca=conf, observacao=f"Parecido com: {hist_razao[:60]}")]
 
+        # 7a) padrão forte do banco (>= 90%) vem antes de adivinhar pelo valor
+        dom = self.dominante.get((mov.conta_banco, mov.entrada))
+        if dom and dom[2] >= 0.9:
+            conta, h, frac = dom
+            return [self._base(mov, conta_contra=conta, historico=h.upper(), status="ok",
+                               origem="Padrão do banco no razão", confianca=int(frac * 100),
+                               observacao=f"{int(frac * 100)}% das {'entradas' if mov.entrada else 'saídas'} deste banco no razão vão para {self.nome_conta(conta)}")]
+
         # 7) procura o valor em todos os clientes/fornecedores (nome não identificado)
         cand, outros = self._buscar_em_todos(mov)
         if cand:
@@ -484,6 +632,15 @@ class Classificador:
                 return r
         dica = ("Possíveis: " + "; ".join(f"{self.nome_conta(o.conta)} — {o.explicacao}" for o in outros)) if outros else ""
 
+        # 8) conta dominante do banco (ex.: quase todas as entradas do Mercado Pago vão para "Clientes Mercado Pago")
+        dom = self.dominante.get((mov.conta_banco, mov.entrada))
+        if dom:
+            conta, h, frac = dom
+            return [self._base(mov, conta_contra=conta, historico=h.upper(), status="ok" if frac >= 0.9 else "revisar",
+                               origem="Padrão do banco no razão", confianca=int(frac * 100),
+                               motivo="" if frac >= 0.9 else "Padrão do banco — confirme",
+                               observacao=f"{int(frac * 100)}% das {'entradas' if mov.entrada else 'saídas'} deste banco no razão vão para {self.nome_conta(conta)}")]
+
         if parte:
             r = self._lancar_parte(mov, parte, score, "Cliente/fornecedor identificado")
             if r:
@@ -497,14 +654,36 @@ class Classificador:
 
     # ------------------------------------------------------------------ partes / NF
     def _lancar_parte(self, mov: Movimento, conta: Conta, score: int, origem: str, nfs: list[str] | None = None,
-                      nome_parte: str = "", candidato: Candidato | None = None) -> list[Lancamento] | None:
+                      nome_parte: str = "", candidato: Candidato | None = None, filtro_nome: str = "") -> list[Lancamento] | None:
         if conta is None:
             return None
         parte = nome_parte or conta.nome
         nfs = nfs or extrair_nfs(mov.descricao)
         pagando = not mov.entrada
+        sem_controle = conta.codigo == self.conta_clientes_generica or (
+            self.titulos_abertos(conta.codigo) and all(not t.nf for t in self.titulos_abertos(conta.codigo)))
+        if candidato is None and sem_controle and not filtro_nome:
+            # conta sem controle por nota (clientes genérica, Mercado Pago...): a conta é o que importa
+            chave = "pagamento_fornecedor" if pagando else "recebimento_cliente"
+            nf_txt = ", ".join(nfs) if nfs else ""
+            return [self._base(mov, conta_contra=conta.codigo, historico=self._modelo(chave + ("_nf" if nf_txt else ""), nf=nf_txt, parte=parte),
+                               nf=nf_txt, parte=parte, status="ok" if score >= 85 else "revisar", origem=origem,
+                               confianca=min(score, 92), motivo="" if score >= 85 else "Confirme a conta")]
+        if candidato is None and ((conta.tipo == "cliente" and pagando) or (conta.tipo == "fornecedor" and not pagando)):
+            # devolução/estorno: sem busca de nota
+            hist = self._generico(mov, ("DEVOLUCAO/ESTORNO - " + parte))
+            return [self._base(mov, conta_contra=conta.codigo, historico=hist, parte=parte,
+                               status="ok" if score >= 90 else "revisar", origem=origem, confianca=min(score, 90),
+                               motivo="" if score >= 90 else "Devolução/estorno — confirme",
+                               observacao="Movimento no sentido contrário ao da conta (devolução, estorno ou reembolso)")]
         if candidato is None:
-            cands = buscar(self.titulos_abertos(conta.codigo), mov.valor, mov.data, nfs, self.perfil.tolerancia_juros_pct)
+            abertos = self.titulos_abertos(conta.codigo)
+            if filtro_nome:
+                alvo = normalizar(filtro_nome)
+                abertos = [t for t in abertos if fuzz.token_set_ratio(alvo, normalizar(t.historico)) >= 88]
+            cands = buscar(abertos, mov.valor, mov.data, nfs, self.perfil.tolerancia_juros_pct)
+            if filtro_nome:  # conta genérica: só aceita hipóteses fortes do mesmo comprador
+                cands = [c for c in cands if c.tipo in ("nf", "exato", "soma", "parcela", "juros", "desconto", "retencao")]
             candidato = cands[0] if cands else None
             alternativas = cands[1:3]
         else:
@@ -515,9 +694,21 @@ class Classificador:
             nf_txt = ", ".join(nfs) if nfs else ""
             hist = self._modelo(chave + ("_nf" if nf_txt else ""), nf=nf_txt, parte=parte)
             abertos = self.titulos_abertos(conta.codigo)
+            if filtro_nome:
+                abertos = [t for t in abertos if fuzz.token_set_ratio(normalizar(filtro_nome), normalizar(t.historico)) >= 88]
             obs = ("Nenhuma nota em aberto no razão para " + parte if not abertos else
                    f"Nenhuma combinação das {len(abertos)} notas em aberto explica o valor: "
                    + ", ".join(f"NF {t.nf or 's/n'} {br(t.saldo)}" for t in abertos[:5]))
+            if nfs and score >= 90 and conta.tipo == "fornecedor":
+                return [self._base(mov, conta_contra=conta.codigo, historico=hist, nf=nf_txt, parte=parte,
+                                   status="ok", origem=origem, confianca=min(score, 88),
+                                   observacao=f"NF {nf_txt} informada no relatório do cliente; ainda não consta no razão")]
+            if filtro_nome or conta.codigo == self.conta_clientes_generica:
+                # conta genérica de clientes: a conta é certa; só a nota não foi localizada
+                return [self._base(mov, conta_contra=conta.codigo, historico=hist, nf=nf_txt, parte=parte,
+                                   status="ok" if score >= 85 else "revisar", origem=origem, confianca=min(score, 88),
+                                   observacao="Nota do comprador não localizada no razão (conta de clientes genérica)",
+                                   motivo="" if score >= 85 else "Confirme o cliente")]
             return [self._base(mov, conta_contra=conta.codigo, historico=hist, nf=nf_txt, parte=parte,
                                status="revisar", origem=origem, confianca=min(score, 70), observacao=obs,
                                motivo="Nota não encontrada")]
@@ -531,6 +722,8 @@ class Classificador:
         hist = self._modelo(chave + ("_nf" if nf_hist else ""), nf=nf_hist, parte=parte)
         conf = min(score, c.pontos)
         status = "ok" if conf >= 85 and c.tipo in ("nf", "exato", "soma") else "revisar"
+        if filtro_nome and score >= 85:
+            status = "ok"   # conta genérica de clientes: a nota é só indicação
         obs = c.explicacao
         if alternativas:
             obs += " | Outras hipóteses: " + "; ".join(a.explicacao for a in alternativas)
@@ -612,39 +805,74 @@ class Classificador:
             return []
         v = round(abs(mov.valor), 2)
         tipo = "receber" if mov.entrada else "pagar"
-        livres = [i for i in self.financeiro if not i.usado and (not i.tipo or i.tipo == tipo) and i.data]
+        banco_mov = self._banco_id.get(mov.conta_banco, "")
+        livres = [i for i in self.financeiro if not i.usado and (not i.tipo or i.tipo == tipo) and i.data
+                  and (not i.banco or not banco_mov or i.banco == banco_mov)]
         for dias in (0, 1, 3):
             perto = [i for i in livres if abs((i.data - mov.data).days) <= dias]
             for i in perto:
                 if abs(i.valor - v) < 0.01:
                     i.usado = True
                     return [i]
-            if dias == 0 and 2 <= len(perto) <= 16:
-                for n in range(2, min(6, len(perto)) + 1):
-                    for comb in itertools.combinations(perto, n):
-                        if abs(sum(i.valor for i in comb) - v) < 0.01:
-                            for i in comb:
-                                i.usado = True
-                            return list(comb)
+            if dias <= 1 and len(perto) >= 2:
+                comb = subconjunto_soma(perto, v)
+                if comb:
+                    for i in comb:
+                        i.usado = True
+                    return comb
         return []
 
     def _lancar_financeiro(self, mov: Movimento, itens: list[ItemFinanceiro]) -> list[Lancamento]:
         out: list[Lancamento] = []
         for it in itens:
+            n_antes = len(out)
             sub = Movimento(id=mov.id, data=mov.data, descricao=f"{mov.descricao} | {it.nome} {it.descricao}",
                             valor=it.valor if mov.entrada else -it.valor, conta_banco=mov.conta_banco, cnpj=mov.cnpj)
+            texto_it = normalizar(f"{it.descricao} {it.nome}")
+            obs_it = f"Relatório do cliente: {it.descricao}" + (f" (conta {it.conta_cliente} no sistema do cliente)" if it.conta_cliente else "")
+            rp = self._regra_prioritaria(sub, texto_it, nf="", obs=obs_it)
+            if rp:
+                rp.descricao_extrato = mov.descricao
+                out.append(rp)
+                continue
             conta, score = self.identificar_parte(sub, it.nome) if it.nome else (None, 0)
             nfs = [it.nf] if it.nf else []
+            depara = self.depara.get(it.conta_cliente) if it.conta_cliente else ""
+            mem_it = self.perfil.memoria.get(chave_memoria(it.descricao)) if it.descricao else None
+            if mem_it and mem_it.get("conta") in self.contas and self.contas[mem_it["conta"]].tipo not in ("cliente", "fornecedor"):
+                out.append(self._base(sub, conta_contra=mem_it["conta"], historico=formatar(mem_it.get("historico", ""), parte=it.nome,
+                                      descricao=descricao_curta(it.descricao), nf=it.nf, mes=_mes(mov)) or self._generico(mov),
+                                      nf=it.nf, parte=it.nome, status="ok", origem="Memória do cliente (relatório)", confianca=96,
+                                      descricao_extrato=mov.descricao, chave=it.descricao, observacao=obs_it))
+                continue
+            if depara and depara in self.contas and not conta:
+                c_dp = self.contas[depara]
+                if c_dp.tipo in ("cliente", "fornecedor"):
+                    conta, score = c_dp, 90
+                else:
+                    hist = self._hist_regra_para_conta(sub, depara) or self._modelo(
+                        "generico_entrada" if mov.entrada else "generico_saida", descricao=descricao_curta(it.descricao))
+                    out.append(self._base(sub, conta_contra=depara, historico=hist, nf=it.nf, parte=it.nome,
+                                          status="ok", origem=f"De-para conta {it.conta_cliente} do cliente",
+                                          confianca=92, descricao_extrato=mov.descricao, observacao=obs_it))
+                    continue
+            if mov.entrada and self.conta_clientes_generica and (not conta or conta.tipo != "cliente"):
+                conta, score = self.contas[self.conta_clientes_generica], 90
             if conta:
-                r = self._lancar_parte(sub, conta, max(score, 85), "Relatório financeiro", nfs=nfs, nome_parte=conta.nome)
+                generica = conta.codigo == self.conta_clientes_generica
+                r = self._lancar_parte(sub, conta, max(score, 85), "Relatório financeiro", nfs=nfs,
+                                       nome_parte=(it.nome or conta.nome) if generica else conta.nome,
+                                       filtro_nome=it.nome if generica else "")
                 if r:
                     for l in r:
                         l.descricao_extrato = mov.descricao
+                    if not r[0].observacao.startswith("Relatório"):
+                        r[0].observacao = (obs_it + " | " + r[0].observacao).strip(" |")
                     out.extend(r)
                     continue
             # parte não cadastrada: tenta regra/semelhança pela descrição do financeiro
             texto = normalizar(f"{it.descricao} {it.nome}")
-            regra = self._regra(sub, texto)
+            regra = self._regra(sub, texto) or (self._regra(sub, normalizar(mov.descricao)) if len(itens) == 1 else None)
             nome = it.nome or descricao_curta(mov.descricao)
             if regra:
                 r, (conta_r, conf) = regra
@@ -658,13 +886,31 @@ class Classificador:
                 chave = chave[:-3]
             out.append(self._base(sub, historico=self._modelo(chave, nf=it.nf, parte=nome), nf=it.nf, parte=nome,
                                   status="pendente", origem="Relatório financeiro", confianca=30, descricao_extrato=mov.descricao,
-                                  motivo="Sem conta no razão",
+                                  motivo="Conta não identificada",
                                   observacao=f"'{it.nome}' não encontrado no razão; escolha a conta ({it.descricao})".strip()))
+        for l in out:
+            if not l.chave:
+                l.chave = l.descricao_extrato
         return out
 
     # ------------------------------------------------------------------ regras / semelhança
+    def _marcar_chave(self, ls, chave):
+        for l in ls:
+            l.chave = l.chave or chave
+
+    def _regra_prioritaria(self, mov: Movimento, texto: str, nome: str = "", nf: str = "", obs: str = "") -> Lancamento | None:
+        for r in self.regras:
+            if r.prioritaria and r.conta and r.casa(texto, mov.entrada):
+                hist = formatar(r.historico, parte=nome or nome_limpo(mov.descricao), descricao=descricao_curta(texto),
+                                nf=nf, mes=_mes(mov)) or self._generico(mov, self.nome_conta(r.conta))
+                return self._base(mov, conta_contra=r.conta, historico=hist, nf=nf, status="ok",
+                                  origem=f"Regra: {r.nome}", confianca=95, observacao=obs)
+        return None
+
     def _regra(self, mov: Movimento, texto: str):
         for r in self.regras:
+            if r.prioritaria:
+                continue
             if r.casa(texto, mov.entrada):
                 conta, conf = self.contas_regra.get(r.nome, ("", 0))
                 return r, (conta, conf)
@@ -741,3 +987,32 @@ def _mes(mov: Movimento) -> str:
 
 def nf_texto(nfs: list[str]) -> str:
     return ", ".join(nf_chave(n) for n in nfs if nf_chave(n))
+
+
+def subconjunto_soma(itens: list, alvo: float, limite: int = 400):
+    """Acha itens cuja soma é exatamente o alvo (centavos). Usa bitset — rápido mesmo com dezenas de itens.
+    Prefere usar itens na ordem em que aparecem (lotes de cobrança costumam ser contíguos)."""
+    alvo_c = int(round(alvo * 100))
+    vals = [int(round(i.valor * 100)) for i in itens][:limite]
+    if alvo_c <= 0 or not vals:
+        return None
+    # caminho rápido: todos os itens
+    if sum(vals) == alvo_c:
+        return list(itens[: len(vals)])
+    mascara = (1 << (alvo_c + 1)) - 1
+    estados = [1]
+    for v in vals:
+        estados.append((estados[-1] | (estados[-1] << v)) & mascara)
+    if not (estados[-1] >> alvo_c) & 1:
+        return None
+    escolhidos, resto = [], alvo_c
+    for k in range(len(vals), 0, -1):
+        if (estados[k - 1] >> resto) & 1:
+            continue  # dá para formar sem o item k
+        escolhidos.append(itens[k - 1])
+        resto -= vals[k - 1]
+        if resto == 0:
+            break
+    if resto != 0:
+        return None
+    return list(reversed(escolhidos))

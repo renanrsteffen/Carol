@@ -63,7 +63,7 @@ class Candidato:
 
 # ------------------------------------------------------------------------------- retenções
 # Alíquotas usuais de retenção na fonte sobre serviços. Cada combinação é testada.
-_IR = [(0, ""), (1.0, "IRRF 1%"), (1.5, "IRRF 1,5%"), (4.8, "IRRF 4,8%")]
+_IR = [(0, ""), (1.0, "IRRF 1%"), (1.5, "IRRF 1,5%")]
 _CSRF = [(0, ""), (4.65, "PIS/COFINS/CSLL 4,65%")]
 _ISS = [(0, "")] + [(p, f"ISS {p:g}%".replace('.', ',')) for p in (2.0, 2.5, 3.0, 3.5, 4.0, 5.0)]
 _INSS = [(0, ""), (11.0, "INSS 11%")]
@@ -73,8 +73,9 @@ def combinacoes_retencao() -> list[list[tuple[str, float]]]:
     out = []
     for ir, cs, iss, inss in itertools.product(_IR, _CSRF, _ISS, _INSS):
         comps = [(n, p) for p, n in (ir, cs, iss, inss) if p]
-        if comps:
+        if comps and len(comps) <= 3:
             out.append(comps)
+    out.append([("IRRF 4,8%", 4.8), ("PIS/COFINS/CSLL 4,65%", 4.65)])   # órgãos públicos (IN 1.234)
     return out
 
 
@@ -157,7 +158,7 @@ def buscar(abertos: list[Titulo], valor: float, data: date | None = None, nfs: l
     # 4) retenção de impostos (nota cheia menos tributos retidos)
     if usar_retencao and not iguais:
         for t in abertos[:30]:
-            if abs(t.saldo - t.valor) > TOL:   # só nota ainda sem baixa
+            if abs(t.saldo - t.valor) > TOL or t.valor < 300:   # só nota cheia e de valor relevante
                 continue
             for comps in _COMBOS:
                 ret = _valores_retencao(t.valor, comps)
@@ -260,8 +261,8 @@ def melhor_entre_contas(por_conta: dict[str, list[Titulo]], valor: float, data: 
     Só aceita se a melhor hipótese for forte e claramente melhor que as das outras contas."""
     melhores: list[Candidato] = []
     for conta, tits in por_conta.items():
-        cs = [c for c in buscar(tits, valor, data, nfs, tol_pct, max_notas=4)
-              if c.tipo in ("nf", "exato", "soma", "retencao", "parcela")]
+        cs = [c for c in buscar(tits, valor, data, nfs, tol_pct, max_notas=3, usar_retencao=False)
+              if c.tipo in ("nf", "exato", "soma") and all(b.titulo.nf for b in c.baixas)]
         if cs:
             melhores.append(cs[0])
     melhores.sort(key=lambda c: -c.pontos)

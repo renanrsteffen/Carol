@@ -47,6 +47,7 @@ class Comprovante:
     total: float = 0.0
     arquivo: str = ""
     avisos: list[str] = field(default_factory=list)
+    origem: str = "comprovante"       # comprovante | relacao
 
     @property
     def id(self) -> str:
@@ -98,7 +99,8 @@ def ler_comprovantes(arquivo) -> list[Comprovante]:
     with pdfplumber.open(io.BytesIO(dados)) as pdf:
         for p in pdf.pages:
             paginas.append(p.extract_text() or "")
-    comps = interpretar_texto("\n".join(paginas))
+    texto = "\n".join(paginas)
+    comps = interpretar_relacao(texto) if e_relacao(texto) else interpretar_texto(texto)
     for c in comps:
         c.arquivo = nome
     return comps
@@ -282,3 +284,47 @@ def _interpretar_bloco(bl: list[str], bn: list[str]) -> Comprovante | None:
         c.avisos.append("Composição não encontrada; usado o valor total")
         c.itens = [ItemComposicao("", "SIMPLES NACIONAL" if tipo == "DAS" else "TRIBUTO", c.total, 0, 0, c.total)]
     return c
+
+
+# ------------------------------------------------------------- relação de pagamentos (lista)
+RE_LINHA_RELACAO = re.compile(
+    r"^\s*(\d{2}/\d{2}/\d{4})\s+(\d{4})\s+(\d[\d.\-]{6,})\s+(\d{2}/\d{2}/\d{4})\s+"
+    r"(\d{1,3}(?:\.\d{3})*,\d{2})\s+(\d{1,3}(?:\.\d{3})*,\d{2})\s+(\d{1,3}(?:\.\d{3})*,\d{2})\s+(\d{1,3}(?:\.\d{3})*,\d{2})\s*$")
+
+
+def e_relacao(texto: str) -> bool:
+    n = normalizar(texto[:4000])
+    return "PAGAMENTOS SELECIONADOS" in n or "NAO SERVE COMO COMPROVANTE" in n
+
+
+def interpretar_relacao(texto: str) -> list[Comprovante]:
+    """Relação "Consulta de pagamentos" do e-CAC: uma linha por documento, sem o banco.
+    O banco é descoberto depois, pelo cruzamento com os extratos."""
+    m = RE_CNPJ.search(texto)
+    cnpj = re.sub(r"\D", "", m[1]) if m else ""
+    out = []
+    for linha in texto.splitlines():
+        ml = RE_LINHA_RELACAO.match(linha)
+        if not ml:
+            continue
+        pr, mu, ju, to = (parse_valor(ml[i]) or 0.0 for i in (5, 6, 7, 8))
+        cod = ml[2]
+        out.append(Comprovante(
+            tipo="DAS" if cod in CODIGOS_DAS else "DARF", numero=ml[3], data_arrecadacao=parse_data(ml[1]),
+            periodo_apuracao=parse_data(ml[4]), cnpj=cnpj,
+            itens=[ItemComposicao(cod, DESCRICAO_CODIGO.get(cod, f"RECEITA {cod}"), round(pr, 2), round(mu, 2), round(ju, 2), round(to, 2))],
+            total=round(to, 2), origem="relacao"))
+    return out
+
+
+# códigos de receita mais comuns (o restante é aprendido no razão do cliente)
+DESCRICAO_CODIGO = {
+    "0086": "II - IMPOSTO DE IMPORTACAO", "1038": "IPI VINCULADO A IMPORTACAO", "5602": "PIS IMPORTACAO",
+    "5629": "COFINS IMPORTACAO", "7811": "TAXA DE UTILIZACAO DO SISCOMEX", "8109": "PIS", "6912": "PIS NAO CUMULATIVO",
+    "2172": "COFINS", "5856": "COFINS NAO CUMULATIVA", "2089": "IRPJ LUCRO PRESUMIDO", "2372": "CSLL LUCRO PRESUMIDO",
+    "0220": "IRPJ ESTIMATIVA", "2362": "IRPJ ESTIMATIVA", "2484": "CSLL ESTIMATIVA", "0561": "IRRF TRABALHO ASSALARIADO",
+    "0588": "IRRF TRABALHO SEM VINCULO", "1708": "IRRF SERVICOS PJ", "3208": "IRRF ALUGUEIS", "5952": "PIS/COFINS/CSLL RETIDOS",
+    "8045": "IRRF COMISSOES", "5123": "IPI", "1097": "IPI", "1410": "DCTFWEB - CONTRIBUICOES PREVIDENCIARIAS",
+    "1082": "DCTFWEB - CP SEGURADOS", "1099": "DCTFWEB - CP PATRONAL",
+}
+CODIGOS_DAS: set[str] = set()
