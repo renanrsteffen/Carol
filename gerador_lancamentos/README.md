@@ -108,6 +108,20 @@ Formais e em maiúsculas, com o número da nota quando houver. Padrões (editáv
 - `VLR. RECEBIDO REF. NF 123 PARC. 2/3 - CLIENTE X`
 - `VLR. IRRF RETIDO S/ NF 20 - CLIENTE X`
 
+## Recursos aprendidos com o primeiro cliente real
+
+Testado com um razão real do SIGER (dezenas de milhares de lançamentos), 5 extratos OFX, 4 extratos conciliados do sistema do cliente e a relação de pagamentos do e-CAC: **85% dos movimentos saíram prontos** e **todos os bancos fecharam com diferença zero**.
+
+- **Razão do SIGER**: código reduzido = final da classificação (`1.1.1.02.02.00205` → 205); tipo da conta pelo nome do **Grupo** (BANCOS CONTA MOVIMENTO, CLIENTES, FORNECEDORES…); saldo devedor positivo; nº da nota na coluna N.DOCTO.
+- **Extrato conciliado do sistema do cliente** (PDF "Extrato Bancário" com Conta/Custo/Histórico/Entradas/Saídas): cada linha traz a conta do plano do cliente e o histórico detalhado (NF, fornecedor, sócio). Os totais de cada dia são conferidos com o impresso.
+- **Lote de cobrança**: um crédito "LIQ.COBRANCA" é casado com a soma dos recebimentos do dia no relatório do cliente (mesmo com dezenas de itens).
+- **Transferências entre contas próprias**: a saída de um banco e a entrada no outro geram **um** lançamento; a outra ponta fica marcada para não duplicar.
+- **Padrão do banco**: se ≥ 75% das entradas (ou saídas) de um banco vão para a mesma conta no razão (ex.: Mercado Pago → Clientes Mercado Pago), essa conta vira a sugestão; ≥ 90% sai pronto.
+- **Conta genérica de clientes** (ex.: CLIENTES NO PAIS): a conta é certa; a NF do comprador é buscada pelo nome e entra como indicação.
+- **De-para** (Configurações): conta do plano do cliente → conta Steffen. O programa sugere os códigos cujas linhas caem sempre na mesma regra (tarifas, IOF, aplicação…).
+- **Regras prioritárias** (sócios): valem antes da busca por nome. Forma simples: `FULANO + CHINA` (todas as palavras precisam aparecer).
+- **Relação de pagamentos do e-CAC** (lista sem banco): o banco vem do cruzamento com os extratos; a conta de cada **código de receita é aprendida no razão** (como o escritório lançou esse código nos meses anteriores, inclusive "total na conta do parcelamento"). Códigos novos ficam 🔴 e podem ser definidos em Configurações › Códigos de receita.
+
 ## Arquivos aceitos
 
 - **Razão**: Excel ou CSV exportado do sistema. Aceita o razão por conta (linha `Conta: 123 - 1.1.1.02.001 - NOME`, seguida dos movimentos) ou com coluna de conta em cada linha. As colunas são encontradas pelo cabeçalho (*Data, Histórico, Débito, Crédito, Lote, Lançamento*). A contrapartida vem de `Contrapartida:` no histórico, de uma coluna própria ou do par lote + lançamento.
@@ -132,7 +146,8 @@ core/busca.py           busca do pagamento nas notas em aberto (parcela, retenç
 core/armazenamento.py   pasta dados/, gravação segura, trabalhos salvos e backups
 core/estado.py          salvar/abrir o trabalho do mês
 core/ecac.py            leitura dos comprovantes de arrecadação do e-CAC
-core/tributos.py        identificação do tributo e das contas (passivo, despesa, multa, juros, banco)
+core/tributos.py        identificação do tributo e das contas; aprendizado dos códigos de DARF no razão
+core/conciliado.py      leitura do extrato conciliado do sistema do cliente (PDF)
 core/perfil.py          perfil do cliente, regras padrão, modelos de histórico, memória
 core/exportar.py        arquivo SIGER e planilha de conferência
 exemplos/               gerador de dados fictícios para teste
