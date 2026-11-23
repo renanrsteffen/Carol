@@ -9,6 +9,8 @@ Transforma **extratos bancários** (e, se houver, o **relatório financeiro** do
 3. Dê dois cliques em **`iniciar.bat`** (Windows) ou rode `./iniciar.sh` (Mac/Linux). A pasta pode ficar no computador ou na rede (`\\servidor\...`); as bibliotecas são instaladas em cada computador e os dados ficam na pasta do programa.
    Na primeira vez ele instala o que precisa (alguns minutos); depois abre direto no navegador.
 
+**Sem a janela preta:** depois da primeira instalação, abra pelo **`Abrir Gerador.vbs`** (crie um atalho dele na área de trabalho). Ele inicia o programa escondido e abre o navegador; se o programa já estiver aberto, só abre o navegador. Para encerrar, use **⏻ Fechar programa** na barra lateral. Se algo der errado, o `iniciar.bat` continua funcionando e mostra a mensagem de erro.
+
 O programa roda no próprio computador: nenhum arquivo do cliente é enviado para a internet, e depois de instalado funciona sem internet. As versões das bibliotecas estão fixadas em `requirements.txt`, então atualizações externas não quebram o programa.
 
 ## Onde ficam os dados e backup

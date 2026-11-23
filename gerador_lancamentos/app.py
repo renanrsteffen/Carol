@@ -189,6 +189,15 @@ with st.sidebar:
         if SS.salvo_em:
             st.caption(f"💾 Trabalho salvo automaticamente às {SS.salvo_em:%H:%M:%S}")
 
+    st.divider()
+    if st.button("⏻ Fechar programa", width="stretch", help="Encerra o programa (o trabalho já está salvo)."):
+        import os
+        import threading
+        salvar_trabalho_atual()
+        st.success("Programa encerrado. Pode fechar esta aba do navegador.")
+        threading.Timer(1.5, lambda: os._exit(0)).start()
+        st.stop()
+
 if not SS.perfil:
     st.header("Gerador de Lançamentos Contábeis")
     st.info("Escolha ou crie um cliente na barra lateral para começar.")

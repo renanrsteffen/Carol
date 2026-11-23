@@ -58,8 +58,15 @@ if defined INSTALAR (
   copy /y "requirements.txt" "%AMBIENTE%\requirements.txt" >nul
 )
 
+REM "iniciar.bat oculto" = chamado pelo "Abrir Gerador.vbs", sem janela e sem abrir o navegador
+if /i "%~1"=="oculto" (
+  "%PY%" -m streamlit run app.py --browser.gatherUsageStats false --server.address localhost --server.port 8501 --server.headless true
+  popd
+  exit /b 0
+)
+
 echo.
 echo Abrindo o programa no navegador... (feche esta janela para encerrar)
-"%PY%" -m streamlit run app.py --browser.gatherUsageStats false --server.address localhost
+"%PY%" -m streamlit run app.py --browser.gatherUsageStats false --server.address localhost --server.port 8501
 popd
 pause
