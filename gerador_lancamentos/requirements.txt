@@ -1,8 +1,9 @@
-# Versões fixas (testadas juntas) para o programa não quebrar com atualizações.
-# Requer Python 3.11 ou superior.
-streamlit==1.67.0
-pandas==3.0.5
-openpyxl==3.1.5
-xlrd==2.0.2
-pdfplumber==0.11.10
-rapidfuzz==3.14.6
+# Faixas de versão testadas. O instalador usa sempre pacotes prontos (sem compilar),
+# escolhendo a versão mais nova que exista para o Python do computador.
+# Requer Python 3.10 a 3.14, 64 bits (recomendado: 3.13 ou 3.12).
+streamlit>=1.40,<2
+pandas>=2.2,<4
+openpyxl>=3.1,<4
+xlrd>=2.0,<3
+pdfplumber>=0.11,<1
+rapidfuzz>=3.0,<4
