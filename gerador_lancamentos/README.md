@@ -32,7 +32,7 @@ Tudo fica na pasta **`dados/`**, dentro da pasta do programa:
 
 | Etapa | O que fazer |
 |---|---|
-| **Cliente** (barra lateral) | Crie ou escolha o cliente. Informe o número e a descrição do lote. |
+| **Cliente** (barra lateral) | Escolha o cliente digitando a sigla ou parte do nome. Na primeira vez, use **📥 Importar relação de clientes** (Excel com razão social, sigla, CNPJ/CPF, regime e cidade) para cadastrar todos de uma vez; importar de novo só completa, não duplica. Informe o número e a descrição do lote. Se o razão enviado for de outra empresa (CNPJ do cabeçalho), o programa avisa. |
 | **1 · Arquivos** | Envie o **razão** (Excel/CSV), os **extratos** (OFX, Excel, CSV ou PDF) e, se tiver, o **relatório financeiro**. Escolha a conta contábil de cada extrato (fica gravada para os próximos meses). Clique em **Gerar lançamentos**. |
 | **2 · Lançamentos** | Fila de revisão. Uma linha por movimento do extrato; o que pede atenção vem primeiro, com o motivo em poucas palavras (🔴 precisa de decisão · 🟡 conferir · 🟢 pronto · 📗 já no razão · ⚪ ignorado). Clique na linha: o painel mostra o porquê, o lançamento proposto e as **outras possibilidades encontradas**; escolha, ajuste histórico/NF se quiser e **Confirmar** — a fila segue para o próximo. **Desfazer** volta à sugestão do programa. |
 | **Comprovantes e-CAC** (opcional, na aba 1) | PDFs de DARF, DAS, DCTFWeb e GPS. Cada comprovante vira lançamentos por tributo, com multa e juros separados — veja abaixo. |

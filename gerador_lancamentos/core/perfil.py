@@ -101,6 +101,9 @@ RUIDO_BANCARIO = {
 class Perfil:
     nome: str
     cnpj: str = ""
+    sigla: str = ""
+    regime: str = ""
+    cidade: str = ""
     lote: str = "1"
     descricao_lote: str = ""
     contas_banco: dict = field(default_factory=dict)        # identificador do extrato -> código da conta
@@ -154,6 +157,22 @@ class Perfil:
             if d:
                 nomes.append(d.get("nome", p.stem))
         return sorted(nomes, key=str.upper)
+
+    @classmethod
+    def todos(cls) -> list["Perfil"]:
+        """Todos os perfis gravados (para busca por CNPJ e importação)."""
+        arm.migrar_pasta_antiga()
+        out = []
+        if arm.PASTA_CLIENTES.exists():
+            for p in sorted(arm.PASTA_CLIENTES.glob("*.json")):
+                d = arm.ler_json(p)
+                if d:
+                    out.append(cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__}))
+        return out
+
+    @property
+    def rotulo(self) -> str:
+        return f"{self.sigla} · {self.nome}" if self.sigla else self.nome
 
     # ------------------------------------------------------------------ helpers
     def obter_regras(self) -> list[Regra]:

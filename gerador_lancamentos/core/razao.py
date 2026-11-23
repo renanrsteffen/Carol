@@ -133,6 +133,8 @@ class Razao:
         self.avisos: list[str] = []
         self.saldos_anteriores: dict[str, tuple[float, bool, object]] = {}  # conta -> (valor, sinal explícito, data)
         self.saldo_devedor_positivo = False
+        self.cnpj_empresa = ""
+        self.nome_empresa = ""
 
     # ------------------------------------------------------------------ carga
     @classmethod
@@ -173,6 +175,15 @@ class Razao:
                 continue
             junto = " ".join(ne)
             jn = normalizar(junto)
+
+            # cabeçalho do relatório: "Empresa:XYZ LTDA  Sigla:ABC  CNPJ:00.000.000/0001-00"
+            if not self.cnpj_empresa and "CNPJ" in jn and not mapa:
+                mc = re.search(r"CNPJ\s*:?\s*(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})", junto, re.I)
+                if mc:
+                    self.cnpj_empresa = re.sub(r"\D", "", mc[1])
+                    me = re.search(r"EMPRESA\s*:?\s*(.+?)\s{2,}", junto, re.I)
+                    self.nome_empresa = me[1].strip() if me else ""
+                    continue
 
             # grupo do plano (SIGER): "Grupo: 1.1.1.02.02 BANCOS CONTA MOVIMENTO"
             mg = re.match(r"^GRUPO\s*:?\s*[\d.]+\s+(.*)$", jn)

@@ -129,10 +129,27 @@ def opcoes_contas() -> list[str]:
 with st.sidebar:
     st.title("📒 Lançamentos")
     st.caption("Extratos + razão → lançamentos para importar no SIGER")
-    existentes = Perfil.listar()
+    todos = sorted(Perfil.todos(), key=lambda p: (p.sigla or p.nome).upper())
+    existentes = [p.nome for p in todos]
+    rotulos = {p.nome: p.rotulo for p in todos}
     escolha = st.selectbox("Cliente", ["(novo cliente)"] + existentes,
-                           index=(existentes.index(SS.perfil.nome) + 1) if SS.perfil and SS.perfil.nome in existentes else 0)
+                           index=(existentes.index(SS.perfil.nome) + 1) if SS.perfil and SS.perfil.nome in existentes else 0,
+                           format_func=lambda n: rotulos.get(n, n),
+                           help="Digite a sigla ou parte do nome para buscar.")
     if escolha == "(novo cliente)":
+        with st.expander("📥 Importar relação de clientes (Excel)", expanded=not existentes):
+            st.caption("Planilha com razão social, sigla, CNPJ/CPF, regime e cidade. Quem já existe é só completado; nada é apagado.")
+            arq_cli = st.file_uploader("Relação de clientes", type=["xlsx", "xls", "csv"], key="up_clientes",
+                                       label_visibility="collapsed")
+            if arq_cli is not None and st.button("Importar clientes", width="stretch"):
+                from core.clientes import importar_clientes, ler_relacao_clientes
+                lista = ler_relacao_clientes(arq_cli)
+                if not lista:
+                    st.error("Não encontrei a coluna de razão social/nome na planilha.")
+                else:
+                    n_novos, n_atual = importar_clientes(lista)
+                    st.success(f"{len(lista)} clientes lidos: {n_novos} cadastrados, {n_atual} completados.")
+                    st.rerun()
         novo = st.text_input("Nome do novo cliente")
         if st.button("Criar cliente", width="stretch"):
             if not novo.strip():
@@ -158,6 +175,8 @@ with st.sidebar:
         if st.button("💾 Salvar cliente", width="stretch"):
             perfil.salvar()
             st.toast("Cliente salvo")
+        if perfil.cnpj or perfil.regime:
+            st.caption(" · ".join(x for x in [perfil.cnpj, perfil.regime.replace("_", " "), perfil.cidade.title()] if x))
         st.caption(f"{len(perfil.memoria)} históricos memorizados · {len(perfil.apelidos)} nomes · {len(perfil.cnpj_conta)} CNPJs")
         trabalhos = arm.listar_trabalhos(perfil.nome)
         if trabalhos:
@@ -263,6 +282,16 @@ with aba_arq:
             if plano:
                 razao_prev.aplicar_plano(ler_plano(plano))
             SS.razao = razao_prev
+            if razao_prev.cnpj_empresa:
+                from core.clientes import cliente_por_cnpj, so_digitos
+                meu = so_digitos(perfil.cnpj)
+                if not meu:
+                    perfil.cnpj = razao_prev.cnpj_empresa
+                elif meu[:8] != razao_prev.cnpj_empresa[:8]:
+                    dono = cliente_por_cnpj(razao_prev.cnpj_empresa)
+                    st.error(f"⚠️ Este razão é de **{razao_prev.nome_empresa or razao_prev.cnpj_empresa}** "
+                             f"(CNPJ {razao_prev.cnpj_empresa}), não de {perfil.rotulo}."
+                             + (f" Troque para o cliente **{dono.rotulo}** na barra lateral." if dono else ""))
             n_tipos = {t: len(razao_prev.contas_do_tipo(t)) for t in ("banco", "cliente", "fornecedor")}
             st.success(f"Razão: {len(razao_prev.movimentos)} movimentos em {len(razao_prev.contas)} contas — "
                        f"{n_tipos['banco']} bancos, {n_tipos['cliente']} clientes, {n_tipos['fornecedor']} fornecedores.")
